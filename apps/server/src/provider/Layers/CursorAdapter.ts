@@ -1274,6 +1274,14 @@ export function makeCursorAdapter(
             resumeCursor: ctx.session.resumeCursor,
           };
         }).pipe(
+          Effect.tapError(() =>
+            Effect.gen(function* () {
+              yield* Effect.ignore(ctx.acp.drainEvents);
+              if (ctx.promptsInFlight === 1) {
+                yield* finishLiveTasks(ctx, "failed");
+              }
+            }),
+          ),
           Effect.ensuring(
             Effect.sync(() => {
               ctx.promptsInFlight = Math.max(0, ctx.promptsInFlight - 1);
