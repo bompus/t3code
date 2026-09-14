@@ -650,6 +650,9 @@ const program = Effect.gen(function* () {
             },
           },
         });
+        if (failPrompt) {
+          return yield* AcpError.AcpRequestError.internalError("Mock prompt failure");
+        }
         if (!hangPromptForever) {
           const completeAfterMs =
             Number.isFinite(promptDelayMs) && promptDelayMs > 0 ? promptDelayMs + 200 : 80;

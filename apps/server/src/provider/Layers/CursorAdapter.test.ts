@@ -1694,6 +1694,73 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
     }).pipe(TestClock.withLive),
   );
 
+  it.effect("fails live tasks when the last prompt errors after task.started", () =>
+    Effect.gen(function* () {
+      const adapter = yield* CursorAdapter;
+      const serverSettings = yield* ServerSettingsService;
+      const threadId = ThreadId.make("cursor-task-prompt-fail");
+      const runtimeEvents: Array<ProviderRuntimeEvent> = [];
+      const taskStarted = yield* Deferred.make<void>();
+      const taskCompleted = yield* Deferred.make<void>();
+
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockAgentWrapper({
+          T3_ACP_EMIT_TASK_SUBAGENT: "1",
+          T3_ACP_FAIL_PROMPT: "1",
+        }),
+      );
+      yield* serverSettings.updateSettings({ providers: { cursor: { binaryPath: wrapperPath } } });
+
+      yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.gen(function* () {
+          if (String(event.threadId) !== String(threadId)) {
+            return;
+          }
+          runtimeEvents.push(event);
+          if (event.type === "task.started") {
+            yield* Deferred.succeed(taskStarted, undefined).pipe(Effect.ignore);
+          }
+          if (event.type === "task.completed") {
+            yield* Deferred.succeed(taskCompleted, undefined).pipe(Effect.ignore);
+          }
+        }),
+      ).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("cursor"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+        modelSelection: { instanceId: ProviderInstanceId.make("cursor"), model: "default" },
+      });
+
+      const error = yield* adapter
+        .sendTurn({
+          threadId,
+          input: "spawn a reviewer",
+          attachments: [],
+        })
+        .pipe(Effect.flip);
+      assert.equal(error._tag, "ProviderAdapterRequestError");
+      yield* Deferred.await(taskStarted).pipe(Effect.timeout("10 seconds"));
+      yield* Deferred.await(taskCompleted).pipe(Effect.timeout("10 seconds"));
+
+      const taskEvents = runtimeEvents.filter(
+        (event) => event.type === "task.started" || event.type === "task.completed",
+      );
+      assert.equal(taskEvents.filter((event) => event.type === "task.completed").length, 1);
+      const failed = taskEvents.find((event) => event.type === "task.completed");
+      if (failed?.type === "task.completed") {
+        assert.equal(failed.payload.status, "failed");
+        assert.equal(failed.payload.title, "Ship reviewer-subagent");
+        assert.equal(failed.payload.role, "reviewer-subagent");
+      }
+      assert.isFalse(runtimeEvents.some((event) => event.type === "turn.completed"));
+
+      yield* adapter.stopSession(threadId);
+    }).pipe(TestClock.withLive),
+  );
+
   it.effect("keeps live tasks running when a superseded prompt is cancelled", () =>
     Effect.gen(function* () {
       const adapter = yield* CursorAdapter;
@@ -1763,7 +1830,10 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
         assert.equal(completed[0].payload.role, "reviewer-subagent");
       }
       const types = turnEvents.map((event) => event.type);
-      assert.isFalse(turnEvents.some((event) => event.type === "item.updated"), types.join(","));
+      assert.isFalse(
+        turnEvents.some((event) => event.type === "item.updated"),
+        types.join(","),
+      );
       const settledAt = types.lastIndexOf("turn.completed");
       const completedAt = types.lastIndexOf("task.completed");
       assert.isBelow(completedAt, settledAt);
