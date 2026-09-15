@@ -461,23 +461,51 @@ const ProjectEmoji = TrimmedNonEmptyString.check(Schema.isMaxLength(32));
 
 // Hermes (the Android/iOS JS runtime) has no Intl.Segmenter, and this module
 // loads at app startup, so `new Intl.Segmenter()` crashes mobile on launch.
-// Count grapheme clusters with a small approximation instead: a code point
-// continues the current cluster when it is a combining mark, joiner,
-// variation selector, or emoji modifier, or follows a ZWJ. This must stay
-// runtime-independent (not `typeof Intl.Segmenter` feature detection) so the
-// shared contract validates identically on server, web, and mobile.
-const GRAPHEME_CONTINUATION = /[\p{M}\u200c\u200d\ufe0f\u{1F3FB}-\u{1F3FF}]/u;
+// Count grapheme clusters with a small UAX-29 approximation instead. This must
+// stay runtime-independent (not `typeof Intl.Segmenter` feature detection) so
+// the shared contract validates identically on server, web, and mobile.
+//
+// Covered rules: GB9/GB9a (Extend, SpacingMark, and ZWJ continue the
+// preceding cluster) and GB6-GB8 (Hangul L/V/T/LV/LVT syllable composition).
+// GB11 (emoji ZWJ sequences) needs no handling: only Extended_Pictographic
+// ZWJ sequences join across a ZWJ, and those characters are rejected by the
+// monogram pattern below anyway. Regional_Indicator pairing (GB12/GB13) is
+// likewise unreachable through the pattern.
+const GRAPHEME_EXTEND = /[\p{M}\u200c\u200d\u{1F3FB}-\u{1F3FF}]/u;
+
+type HangulType = "L" | "V" | "T" | "LV" | "LVT";
+
+const hangulType = (codePoint: number): HangulType | null => {
+  if ((codePoint >= 0x1100 && codePoint <= 0x115f) || (codePoint >= 0xa960 && codePoint <= 0xa97c))
+    return "L";
+  if ((codePoint >= 0x1160 && codePoint <= 0x11a7) || (codePoint >= 0xd7b0 && codePoint <= 0xd7c6))
+    return "V";
+  if ((codePoint >= 0x11a8 && codePoint <= 0x11ff) || (codePoint >= 0xd7cb && codePoint <= 0xd7fb))
+    return "T";
+  if (codePoint >= 0xac00 && codePoint <= 0xd7a3)
+    return (codePoint - 0xac00) % 28 === 0 ? "LV" : "LVT";
+  return null;
+};
 
 const countGraphemes = (text: string): number => {
   let clusters = 0;
-  let prevJoiner = false;
+  let prevHangul: HangulType | null = null;
+  let started = false;
   for (const char of text) {
-    if (clusters > 0 && (prevJoiner || GRAPHEME_CONTINUATION.test(char))) {
-      prevJoiner = char === "\u200d";
-      continue;
+    const hangul = hangulType(char.codePointAt(0) ?? 0);
+    let boundary = true;
+    if (started) {
+      if (GRAPHEME_EXTEND.test(char)) boundary = false;
+      else if (prevHangul === "L" && hangul !== null) boundary = false;
+      else if ((prevHangul === "LV" || prevHangul === "V") && (hangul === "V" || hangul === "T"))
+        boundary = false;
+      else if ((prevHangul === "LVT" || prevHangul === "T") && hangul === "T") boundary = false;
     }
-    clusters += 1;
-    prevJoiner = char === "\u200d";
+    if (boundary) {
+      clusters += 1;
+      started = true;
+    }
+    prevHangul = hangul;
   }
   return clusters;
 };

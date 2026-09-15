@@ -1566,6 +1566,37 @@ it.effect("project monograms validate text and palette colors", () =>
   }),
 );
 
+it.effect("project monograms count graphemes without Intl.Segmenter", () =>
+  Effect.gen(function* () {
+    // Hermes (Android/iOS) has no Intl.Segmenter, so the schema counts with a
+    // runtime-independent approximation. ZWJ joins backward only (GB9, no
+    // emoji context in the monogram charset) and Hangul Jamo compose per
+    // GB6-GB8.
+    for (const text of ["A‍B", "가나", "가나", "किखि", "é"]) {
+      const result = yield* Effect.exit(
+        decodeOrchestrationCommand({
+          type: "project.meta.update",
+          commandId: "cmd-monogram-grapheme",
+          projectId: "project-1",
+          projectIcon: { kind: "lucide", name: "folder-code", color: "violet", monogram: text },
+        }),
+      );
+      assert.strictEqual(result._tag, "Success");
+    }
+    for (const text of ["A‍B‍C", "가나가", "किखिगि", "ABC"]) {
+      const result = yield* Effect.exit(
+        decodeOrchestrationCommand({
+          type: "project.meta.update",
+          commandId: "cmd-monogram-grapheme-invalid",
+          projectId: "project-1",
+          projectIcon: { kind: "lucide", name: "folder-code", color: "blue", monogram: text },
+        }),
+      );
+      assert.strictEqual(result._tag, "Failure");
+    }
+  }),
+);
+
 it.effect("rejects thread history imports without messages", () =>
   Effect.gen(function* () {
     const result = yield* Effect.exit(
