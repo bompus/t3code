@@ -1570,9 +1570,9 @@ it.effect("project monograms count graphemes without Intl.Segmenter", () =>
   Effect.gen(function* () {
     // Hermes (Android/iOS) has no Intl.Segmenter, so the schema counts with a
     // runtime-independent approximation. ZWJ joins backward only (GB9, no
-    // emoji context in the monogram charset) and Hangul Jamo compose per
-    // GB6-GB8.
-    for (const text of ["A‍B", "가나", "가나", "किखि", "é"]) {
+    // emoji context in the monogram charset), Hangul Jamo compose per
+    // GB6-GB8, and Indic conjuncts join per GB9c.
+    for (const text of ["A‍B", "가나", "가나", "किखि", "é", "क्ष", "क्षA", "क्‍ष"]) {
       const result = yield* Effect.exit(
         decodeOrchestrationCommand({
           type: "project.meta.update",
@@ -1583,7 +1583,7 @@ it.effect("project monograms count graphemes without Intl.Segmenter", () =>
       );
       assert.strictEqual(result._tag, "Success");
     }
-    for (const text of ["A‍B‍C", "가나가", "किखिगि", "ABC"]) {
+    for (const text of ["A‍B‍C", "가나가", "ᄀᆨᄀ", "किखिगि", "ABC", "क्षAB"]) {
       const result = yield* Effect.exit(
         decodeOrchestrationCommand({
           type: "project.meta.update",

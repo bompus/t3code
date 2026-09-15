@@ -461,18 +461,33 @@ const ProjectEmoji = TrimmedNonEmptyString.check(Schema.isMaxLength(32));
 
 // Hermes (the Android/iOS JS runtime) has no Intl.Segmenter, and this module
 // loads at app startup, so `new Intl.Segmenter()` crashes mobile on launch.
-// Count grapheme clusters with a small UAX-29 approximation instead. This must
-// stay runtime-independent (not `typeof Intl.Segmenter` feature detection) so
-// the shared contract validates identically on server, web, and mobile.
+// Count grapheme clusters with a UAX-29 approximation instead. This must stay
+// runtime-independent (not `typeof Intl.Segmenter` feature detection) so the
+// shared contract validates identically on server, web, and mobile.
 //
-// Covered rules: GB9/GB9a (Extend, SpacingMark, and ZWJ continue the
-// preceding cluster) and GB6-GB8 (Hangul L/V/T/LV/LVT syllable composition).
-// GB11 (emoji ZWJ sequences) needs no handling: only Extended_Pictographic
-// ZWJ sequences join across a ZWJ, and those characters are rejected by the
-// monogram pattern below anyway. Regional_Indicator pairing (GB12/GB13) is
-// likewise unreachable through the pattern.
-const GRAPHEME_EXTEND = /[\p{M}\u200c\u200d\u{1F3FB}-\u{1F3FF}]/u;
-
+// Covered rules: GB9/GB9a (Extend, SpacingMark, and ZWJ continue the preceding
+// cluster), GB6-GB8 (Hangul L/V/T/LV/LVT composition), and GB9c (Indic
+// conjuncts: Consonant (Extend|Linker)* Linker (Extend|Linker)* joins the
+// following Consonant). GB11 emoji-ZWJ joining, GB12-GB13 flag pairing, GB9b
+// Prepend, and control handling are out of scope: none of those characters
+// pass the monogram pattern below, so they cannot affect validation.
+//
+// The GB9c tables and the Extend/SpacingMark refinements were derived from
+// the UCD (GraphemeBreakProperty.txt) plus empirical probing of every L/N/M
+// code point in each GB9c position against Node's Intl.Segmenter (ICU 78 /
+// Unicode 17); re-derive if the Unicode version moves, since the Linker set
+// in particular grows over time.
+const GRAPHEME_EXTEND_BASE =
+  /[\p{M}\u200c\u200d\ufe0f\u{1F3FB}-\u{1F3FF}\u{E33}\u{EB3}\u{1ACF}-\u{1ADD}\u{1AE0}-\u{1AEB}\u{FF9E}-\u{FF9F}\u{10EFA}-\u{10EFB}\u{11B60}-\u{11B67}\u{1E6E3}\u{1E6E6}\u{1E6EE}-\u{1E6EF}\u{1E6F5}\u{E0020}-\u{E007F}]/u;
+// Marks with GCB=Other (e.g. Myanmar AA U+102C): look like marks but break.
+const GRAPHEME_EXTEND_EXCEPT =
+  /[\u{102B}-\u{102C}\u{1038}\u{1062}-\u{1064}\u{1067}-\u{106D}\u{1083}\u{1087}-\u{108C}\u{108F}\u{109A}-\u{109C}\u{1A61}\u{1A63}-\u{1A64}\u{AA7B}\u{AA7D}\u{11720}-\u{11721}]/u;
+const CONJUNCT_LINKER =
+  /[\u{94D}\u{9CD}\u{ACD}\u{B4D}\u{C4D}\u{D4D}\u{1039}\u{17D2}\u{1A60}\u{1B44}\u{1BAB}\u{A9C0}\u{AAF6}\u{10A3F}\u{11133}\u{113D0}\u{1193E}\u{11A47}\u{11A99}\u{11F42}]/u;
+const CONJUNCT_MIDDLE =
+  /[\p{Mn}\p{Me}\u{9BE}\u{9D7}\u{B3E}\u{B57}\u{BBE}\u{BD7}\u{CC0}\u{CC2}\u{CC7}-\u{CC8}\u{CCA}-\u{CCB}\u{CD5}-\u{CD6}\u{D3E}\u{D57}\u{DCF}\u{DDF}\u{1715}\u{1734}\u{1ACF}-\u{1ADD}\u{1AE0}-\u{1AEB}\u{1B35}\u{1B3B}\u{1B3D}\u{1B43}-\u{1B44}\u{1BAA}\u{1BF2}-\u{1BF3}\u{200D}\u{302E}-\u{302F}\u{A953}\u{A9C0}\u{FF9E}-\u{FF9F}\u{10EFA}-\u{10EFB}\u{111C0}\u{11235}\u{1133E}\u{1134D}\u{11357}\u{113B8}\u{113C2}\u{113C5}\u{113C7}-\u{113C9}\u{113CF}\u{114B0}\u{114BD}\u{115AF}\u{116B6}\u{11930}\u{1193D}\u{11B60}\u{11B62}-\u{11B64}\u{11B66}\u{11F41}\u{16FF0}-\u{16FF1}\u{1D165}-\u{1D166}\u{1D16D}-\u{1D172}\u{1E6E3}\u{1E6E6}\u{1E6EE}-\u{1E6EF}\u{1E6F5}]/u;
+const CONJUNCT_CONSONANT =
+  /[\u{915}-\u{939}\u{958}-\u{95F}\u{978}-\u{97F}\u{995}-\u{9A8}\u{9AA}-\u{9B0}\u{9B2}\u{9B6}-\u{9B9}\u{9DC}-\u{9DD}\u{9DF}\u{9F0}-\u{9F1}\u{A95}-\u{AA8}\u{AAA}-\u{AB0}\u{AB2}-\u{AB3}\u{AB5}-\u{AB9}\u{AF9}\u{B15}-\u{B28}\u{B2A}-\u{B30}\u{B32}-\u{B33}\u{B35}-\u{B39}\u{B5C}-\u{B5D}\u{B5F}\u{B71}\u{C15}-\u{C28}\u{C2A}-\u{C39}\u{C58}-\u{C5A}\u{D15}-\u{D3A}\u{1000}-\u{102A}\u{103F}\u{1050}-\u{1055}\u{105A}-\u{105D}\u{1061}\u{1065}-\u{1066}\u{106E}-\u{1070}\u{1075}-\u{1081}\u{108E}\u{1780}-\u{17B3}\u{1A20}-\u{1A54}\u{1B0B}-\u{1B0C}\u{1B13}-\u{1B33}\u{1B45}-\u{1B4C}\u{1B83}-\u{1BA0}\u{1BAE}-\u{1BAF}\u{1BBB}-\u{1BBD}\u{A989}-\u{A98B}\u{A98F}-\u{A9B2}\u{A9E0}-\u{A9E4}\u{A9E7}-\u{A9EF}\u{A9FA}-\u{A9FE}\u{AA60}-\u{AA6F}\u{AA71}-\u{AA73}\u{AA7A}\u{AA7E}-\u{AA7F}\u{AAE0}-\u{AAEA}\u{ABC0}-\u{ABDA}\u{10A00}\u{10A10}-\u{10A13}\u{10A15}-\u{10A17}\u{10A19}-\u{10A35}\u{11103}-\u{11126}\u{11144}\u{11147}\u{11380}-\u{11389}\u{1138B}\u{1138E}\u{11390}-\u{113B5}\u{11900}-\u{11906}\u{11909}\u{1190C}-\u{11913}\u{11915}-\u{11916}\u{11918}-\u{1192F}\u{11A00}\u{11A0B}-\u{11A32}\u{11A50}\u{11A5C}-\u{11A83}\u{11F04}-\u{11F10}\u{11F12}-\u{11F33}]/u;
 type HangulType = "L" | "V" | "T" | "LV" | "LVT";
 
 const hangulType = (codePoint: number): HangulType | null => {
@@ -490,13 +505,27 @@ const hangulType = (codePoint: number): HangulType | null => {
 const countGraphemes = (text: string): number => {
   let clusters = 0;
   let prevHangul: HangulType | null = null;
+  // GB9c left context: 0 none, 1 Consonant, 2 +middles, 3 +Linker seen. A
+  // Linker with no leading Consonant (state 0) opens nothing, so a leading
+  // virama still breaks before the following consonant.
+  let conjunct = 0;
   let started = false;
   for (const char of text) {
-    const hangul = hangulType(char.codePointAt(0) ?? 0);
+    const cp = char.codePointAt(0) ?? 0;
+    const hangul = hangulType(cp);
+    const extend = GRAPHEME_EXTEND_BASE.test(char) && !GRAPHEME_EXTEND_EXCEPT.test(char);
+    const linker = CONJUNCT_LINKER.test(char);
+    const middle = linker || CONJUNCT_MIDDLE.test(char);
+    const consonant = CONJUNCT_CONSONANT.test(char);
     let boundary = true;
     if (started) {
-      if (GRAPHEME_EXTEND.test(char)) boundary = false;
-      else if (prevHangul === "L" && hangul !== null) boundary = false;
+      if (extend) boundary = false;
+      else if (conjunct === 3 && consonant) boundary = false;
+      else if (
+        prevHangul === "L" &&
+        (hangul === "L" || hangul === "V" || hangul === "LV" || hangul === "LVT")
+      )
+        boundary = false;
       else if ((prevHangul === "LV" || prevHangul === "V") && (hangul === "V" || hangul === "T"))
         boundary = false;
       else if ((prevHangul === "LVT" || prevHangul === "T") && hangul === "T") boundary = false;
@@ -505,6 +534,12 @@ const countGraphemes = (text: string): number => {
       clusters += 1;
       started = true;
     }
+    if (consonant) conjunct = 1;
+    else if (middle || linker) {
+      if (linker) {
+        if (conjunct !== 0) conjunct = 3;
+      } else if (conjunct === 1 || conjunct === 2) conjunct = 2;
+    } else conjunct = 0;
     prevHangul = hangul;
   }
   return clusters;
