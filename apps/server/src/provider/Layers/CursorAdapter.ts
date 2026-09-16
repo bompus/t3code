@@ -416,7 +416,7 @@ export function makeCursorAdapter(
     const finishLiveTasks = (
       ctx: CursorSessionContext,
       status: "failed" | "stopped",
-    ): Effect.Effect<void> =>
+    ): Effect.Effect<void, ProviderAdapterRequestError> =>
       Effect.gen(function* () {
         for (const [toolCallId, live] of ctx.liveTasks) {
           yield* offerRuntimeEvent({

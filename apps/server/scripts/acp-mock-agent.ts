@@ -656,18 +656,22 @@ const program = Effect.gen(function* () {
         if (!hangPromptForever) {
           const completeAfterMs =
             Number.isFinite(promptDelayMs) && promptDelayMs > 0 ? promptDelayMs + 200 : 80;
-          yield* Effect.sync(() => {
-            setTimeout(() => {
-              writeJsonRpcNotification("session/update", {
-                sessionId: requestedSessionId,
-                update: {
-                  sessionUpdate: "tool_call_update",
-                  toolCallId,
-                  status: "completed",
-                },
-              });
-            }, completeAfterMs);
-          });
+          yield* Effect.forkDetach(
+            Effect.sleep(`${completeAfterMs} millis`).pipe(
+              Effect.andThen(
+                Effect.sync(() => {
+                  writeJsonRpcNotification("session/update", {
+                    sessionId: requestedSessionId,
+                    update: {
+                      sessionUpdate: "tool_call_update",
+                      toolCallId,
+                      status: "completed",
+                    },
+                  });
+                }),
+              ),
+            ),
+          );
         }
         if (hangPromptForever) {
           return yield* Effect.never;
