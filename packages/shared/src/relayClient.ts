@@ -19,7 +19,7 @@ import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstab
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 import { HostProcessArchitecture, HostProcessPlatform } from "./hostProcess.ts";
 
-export const CLOUDFLARED_VERSION = "2026.9.0";
+export const CLOUDFLARED_VERSION = "2026.9.1";
 const CLOUDFLARED_PATH_ENV_NAME = "T3CODE_CLOUDFLARED_PATH";
 
 export type RelayClientExecutableSource = "override" | "managed" | "path";
@@ -72,28 +72,28 @@ const CLOUDFLARED_RELEASE_ASSETS: Readonly<
   Partial<Record<`${NodeJS.Platform}-${string}`, CloudflaredReleaseAsset>>
 > = {
   "darwin-arm64": {
-    url: "https://github.com/cloudflare/cloudflared/releases/download/2026.9.0/cloudflared-darwin-arm64.tgz",
-    sha256: "c0eccb3758420d1f4e46cbf2b8ecde01d9802a154232a817f25133340009fcc7",
+    url: "https://github.com/cloudflare/cloudflared/releases/download/2026.9.1/cloudflared-darwin-arm64.tgz",
+    sha256: "9a0b19f67dc7a3011bc6b972c7ce06a5fcea8784ac6bd599ffa382ea4aeb5a6e",
     archive: "tgz",
   },
   "darwin-x64": {
-    url: "https://github.com/cloudflare/cloudflared/releases/download/2026.9.0/cloudflared-darwin-amd64.tgz",
-    sha256: "8f2ecf41776d942bcc8070a56e7bafa4c5de70a1d1781110e2eb3774cca512a8",
+    url: "https://github.com/cloudflare/cloudflared/releases/download/2026.9.1/cloudflared-darwin-amd64.tgz",
+    sha256: "1ea07ae775b03236bd6be18ca1848d6bdc4af2f4f3bce398823b5a36e5761b75",
     archive: "tgz",
   },
   "linux-arm64": {
-    url: "https://github.com/cloudflare/cloudflared/releases/download/2026.9.0/cloudflared-linux-arm64",
-    sha256: "98aca3173f73248fad6180fc75dade2d186a6e54fa807e088108cb4345de8efe",
+    url: "https://github.com/cloudflare/cloudflared/releases/download/2026.9.1/cloudflared-linux-arm64",
+    sha256: "3d97437c71848bd8df68041e12436b484a661d95073ea1937f01a845ce88faa3",
     archive: "binary",
   },
   "linux-x64": {
-    url: "https://github.com/cloudflare/cloudflared/releases/download/2026.9.0/cloudflared-linux-amd64",
-    sha256: "53b7a7a5420d188758d24341294acb0d1bca54296548ac05e38811a694ac6134",
+    url: "https://github.com/cloudflare/cloudflared/releases/download/2026.9.1/cloudflared-linux-amd64",
+    sha256: "03f1f25d1cc93b9ad6c60569d44060bc4f17ed97075760ed8cfca4b12dcd68cc",
     archive: "binary",
   },
   "win32-x64": {
-    url: "https://github.com/cloudflare/cloudflared/releases/download/2026.9.0/cloudflared-windows-amd64.exe",
-    sha256: "547057326266f0e1c7d50d102dbd22ff283d740c055bd61e94f10e2c606f89af",
+    url: "https://github.com/cloudflare/cloudflared/releases/download/2026.9.1/cloudflared-windows-amd64.exe",
+    sha256: "2837888cc0f5d58f15b6dc478376de90b4d3ba5241c7947455d1e0a0df429712",
     archive: "binary",
   },
 };
