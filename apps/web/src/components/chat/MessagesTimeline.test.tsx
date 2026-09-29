@@ -87,6 +87,9 @@ beforeEach(() => {
   activityTestState.expandedRuns = false;
 });
 
+// The rows most recently handed to the list, so tests can mirror LegendList state.
+const legendListMock = vi.hoisted(() => ({ data: [] as Array<{ id: string }> }));
+
 vi.mock("@legendapp/list/react", async () => {
   const legendListTestId = "legend-list";
 
@@ -124,6 +127,10 @@ vi.mock("@legendapp/list/react", async () => {
     contentInsetEndAdjustment?: number;
     ref?: Ref<LegendListRef>;
   }) => {
+    // Child layout effects run before the timeline's own.
+    useLayoutEffect(() => {
+      legendListMock.data = props.data;
+    });
     if (props.anchoredEndSpace) {
       props.anchoredEndSpace.onSizeChanged?.(240);
       props.anchoredEndSpace.onReady?.({ anchorIndex: props.anchoredEndSpace.anchorIndex });
@@ -1320,6 +1327,141 @@ describe("MessagesTimeline", () => {
         />,
       ),
     ).not.toContain('data-maintain-scroll-at-end="enabled"');
+  });
+
+  // Switches a mounted timeline to a thread whose position is remembered,
+  // against a list double backed by a mutable DOM viewport.
+  async function switchToRememberedThread(atEnd: boolean) {
+    const { rememberTimelinePosition } = await import("./timelineScrollAnchoring");
+    const frames = new Map<number, FrameRequestCallback>();
+    let nextFrame = 0;
+    vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
+      frames.set(++nextFrame, callback);
+      return nextFrame;
+    });
+    vi.stubGlobal("cancelAnimationFrame", (frame: number) => frames.delete(frame));
+    vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+    // Async so scroll promises can queue their follow-up frames in between.
+    const flushFrame = () =>
+      act(async () => {
+        const callbacks = [...frames.values()];
+        frames.clear();
+        callbacks.forEach((callback) => callback(0));
+      });
+    const entries = [
+      {
+        id: "entry-restore-work",
+        kind: "work" as const,
+        createdAt: MESSAGE_CREATED_AT,
+        entry: {
+          id: "work-restore",
+          createdAt: MESSAGE_CREATED_AT,
+          toolCallId: "call-restore",
+          label: "Run lint",
+          tone: "tool" as const,
+          itemType: "command_execution" as const,
+          command: "pnpm lint",
+          toolLifecycleStatus: "completed" as const,
+        },
+      },
+    ];
+    const noop = () => {};
+    const viewport = {
+      scrollTop: 0,
+      scrollHeight: 2000,
+      clientHeight: 800,
+      getBoundingClientRect: () => ({ top: 0 }),
+      addEventListener: noop,
+      removeEventListener: noop,
+      ownerDocument: { addEventListener: noop, removeEventListener: noop },
+    };
+    const harness = { viewport, rowMounted: true, atEndCalls: [] as boolean[], flushFrame };
+    const props = {
+      ...buildProps(),
+      routeThreadKey: "env-restore:thread-0",
+      onIsAtEndChange: (isAtEnd: boolean) => harness.atEndCalls.push(isAtEnd),
+    };
+    const scrollTo = (offset: number) => {
+      viewport.scrollTop = offset;
+      return Promise.resolve();
+    };
+    props.listRef.current = {
+      getState: () => ({
+        data: legendListMock.data,
+        contentLength: viewport.scrollHeight,
+        scroll: viewport.scrollTop,
+        scrollLength: viewport.clientHeight,
+        positionAtIndex: () => 0,
+        indexByKey: () => 0,
+        elementAtIndex: () =>
+          harness.rowMounted ? { getBoundingClientRect: () => ({ top: 0 }) } : null,
+      }),
+      getScrollableNode: () => viewport,
+      scrollToEnd: () => scrollTo(viewport.scrollHeight - viewport.clientHeight),
+      scrollToIndex: () => Promise.resolve(),
+      scrollToOffset: ({ offset }: { offset: number }) => scrollTo(offset),
+    } as unknown as LegendListRef;
+    let renderer!: ReactTestRenderer;
+    act(() => {
+      renderer = create(<MessagesTimeline {...props} timelineEntries={entries} />);
+    });
+    rememberTimelinePosition("env-restore:thread-1", {
+      rowId: legendListMock.data[0]!.id,
+      offsetWithinRow: 0,
+      scrollOffset: 0,
+      atEnd,
+    });
+    return {
+      harness,
+      async switchThread() {
+        await act(async () => {
+          renderer.update(
+            <MessagesTimeline
+              {...props}
+              routeThreadKey="env-restore:thread-1"
+              timelineEntries={entries}
+            />,
+          );
+        });
+        harness.atEndCalls.length = 0;
+      },
+      cleanup() {
+        act(() => renderer.unmount());
+        vi.unstubAllGlobals();
+      },
+    };
+  }
+
+  it("finishes restoring a reading position when the saved row mounts a frame late", async () => {
+    const { harness, switchThread, cleanup } = await switchToRememberedThread(false);
+    try {
+      harness.rowMounted = false;
+      await switchThread();
+      await harness.flushFrame();
+      harness.rowMounted = true;
+      for (let frame = 0; frame < 4; frame += 1) await harness.flushFrame();
+
+      // Restore finished, so scroll reporting (and with it the pill) resumed.
+      expect(harness.atEndCalls).toContain(false);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("follows the real end when rows measure taller after a restore to the end", async () => {
+    const { harness, switchThread, cleanup } = await switchToRememberedThread(true);
+    try {
+      await switchThread();
+      expect(harness.viewport.scrollTop).toBe(1200);
+      // Estimated rows measure taller after the first jump to the end.
+      harness.viewport.scrollHeight = 5000;
+      for (let frame = 0; frame < 6; frame += 1) await harness.flushFrame();
+
+      expect(harness.viewport.scrollTop).toBe(4200);
+      expect(harness.atEndCalls).toContain(true);
+    } finally {
+      cleanup();
+    }
   });
 
   it("renders collapse controls for long user messages", () => {

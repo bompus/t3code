@@ -866,30 +866,47 @@ export const MessagesTimeline = memo(function MessagesTimeline({
         : list.scrollToEnd({ animated: false });
     void Promise.resolve(scrolling).then(() => {
       if (cancelled) return;
-      if (position?.atEnd !== false || index < 0) {
+      const savedRow = position?.atEnd === false && index >= 0 ? position : null;
+      if (position?.atEnd === false && !savedRow) {
         setPositionedThreadKey(listIdentityKey);
         return;
       }
-      // Index scrolling starts from estimates. Keep the saved row mounted
-      // until its measured position and the DOM agree for two layout frames.
+      // Scrolling starts from estimated row sizes, so the first jump lands
+      // short once real rows measure. Keep the target (the saved row, or the
+      // end) mounted and corrected until it and the DOM agree for two layout
+      // frames. The frame cap hands a still-growing thread to end
+      // maintenance instead of leaving it restoring with scroll tracking off.
       let stableFrames = 0;
+      let frames = 0;
       const reconcile = () => {
         if (cancelled) return;
+        if (++frames > 30) {
+          setPositionedThreadKey(listIdentityKey);
+          return;
+        }
         const state = list.getState();
-        const rowIndex = state.indexByKey(position.rowId);
+        const rowIndex = savedRow ? state.indexByKey(savedRow.rowId) : undefined;
         const row = rowIndex === undefined ? undefined : state.elementAtIndex(rowIndex);
         const element = list.getScrollableNode();
-        if (!row || !element) return;
-        const offset = Math.max(
-          0,
-          Math.min(
-            element.scrollTop +
-              row.getBoundingClientRect().top -
-              element.getBoundingClientRect().top +
-              position.offsetWithinRow,
-            element.scrollHeight - element.clientHeight,
-          ),
-        );
+        // The saved row can mount a frame after the estimated scroll.
+        if (!element || (savedRow && !row)) {
+          settleFrame = requestAnimationFrame(reconcile);
+          return;
+        }
+        const endOffset = element.scrollHeight - element.clientHeight;
+        const offset =
+          savedRow && row
+            ? Math.max(
+                0,
+                Math.min(
+                  element.scrollTop +
+                    row.getBoundingClientRect().top -
+                    element.getBoundingClientRect().top +
+                    savedRow.offsetWithinRow,
+                  endOffset,
+                ),
+              )
+            : endOffset;
         if (Math.abs(element.scrollTop - offset) > 1) {
           stableFrames = 0;
           void list.scrollToOffset({ offset, animated: false }).then(() => {
