@@ -367,6 +367,10 @@ function TimelineListFooter({ composerInset }: { readonly composerInset: number 
   );
 }
 const EMPTY_TIMELINE_SKILLS: ReadonlyArray<Pick<ServerProviderSkill, "name" | "displayName">> = [];
+// About half a second at 60 Hz. A thread still growing after this many frames
+// is handed to end maintenance instead of staying in restore with scroll
+// tracking off.
+const THREAD_RESTORE_MAX_FRAMES = 30;
 const TIMELINE_MAINTAIN_SCROLL_AT_END = {
   animated: false,
   on: {
@@ -793,8 +797,12 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       restoringThreadPosition && restoreRowIndex >= 0 ? { indices: [restoreRowIndex] } : undefined,
     [restoreRowIndex, restoringThreadPosition],
   );
+  // Rows stream in while a thread is restoring. The restore depends on
+  // whether any exist and where the saved row sits, not on each new row, so a
+  // streaming thread keeps one restore instead of restarting it every chunk.
+  const hasRows = rows.length > 0;
   useLayoutEffect(() => {
-    if (!restoringThreadPosition || rows.length === 0) return;
+    if (!restoringThreadPosition || !hasRows) return;
     const list = listRef.current;
     if (!list) return;
     if (citationRequest !== null) {
@@ -812,9 +820,13 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       if (viewport) void list.scrollToOffset({ offset: viewport.scrollTop, animated: false });
       setPositionedThreadKey(listIdentityKey);
     };
+    const position = rememberedPosition;
+    // A restore to the end only stops correcting on a gesture. ChatView's own
+    // listeners decide whether that gesture leaves the end, so a wheel down
+    // or a click at the bottom keeps following.
     const cancelForNavigation = () => {
       cancelRestoration();
-      onManualNavigation();
+      if (position?.atEnd === false) onManualNavigation();
     };
     const onScrollKey = (event: globalThis.KeyboardEvent) => {
       if (
@@ -830,15 +842,13 @@ export const MessagesTimeline = memo(function MessagesTimeline({
     viewport?.addEventListener("touchmove", cancelForNavigation, { passive: true });
     viewport?.addEventListener("pointerdown", cancelForNavigation, { passive: true });
     viewport?.ownerDocument.addEventListener("keydown", onScrollKey);
-    const position = rememberedPosition;
-    const index = position ? rows.findIndex((row) => row.id === position.rowId) : -1;
     if (position?.atEnd === false) onManualNavigation();
     if (cancelPositionRestoreRef) cancelPositionRestoreRef.current = cancelRestoration;
     const scrolling =
       position?.atEnd === false
-        ? index >= 0
+        ? restoreRowIndex >= 0
           ? list.scrollToIndex({
-              index,
+              index: restoreRowIndex,
               animated: false,
               viewPosition: 0,
               viewOffset: -position.offsetWithinRow,
@@ -847,28 +857,34 @@ export const MessagesTimeline = memo(function MessagesTimeline({
         : list.scrollToEnd({ animated: false });
     void Promise.resolve(scrolling).then(() => {
       if (cancelled) return;
-      const savedRow = position?.atEnd === false && index >= 0 ? position : null;
-      if (position?.atEnd === false && !savedRow) {
+      if (position?.atEnd === false && restoreRowIndex < 0) {
         setPositionedThreadKey(listIdentityKey);
         return;
       }
+      const savedRow = position?.atEnd === false ? position : null;
       // Scrolling starts from estimated row sizes, so the first jump lands
-      // short once real rows measure. Keep the target (the saved row, or the
-      // end) mounted and corrected until it and the DOM agree for two layout
-      // frames. The frame cap hands a still-growing thread to end
-      // maintenance instead of leaving it restoring with scroll tracking off.
+      // short once real rows measure. Keep correcting toward the target (the
+      // saved row, or the end) until it and the DOM agree for two frames.
       let stableFrames = 0;
       let frames = 0;
       const reconcile = () => {
         if (cancelled) return;
-        if (++frames > 30) {
+        const element = list.getScrollableNode();
+        if (++frames > THREAD_RESTORE_MAX_FRAMES) {
+          // End maintenance only re-pins within a viewport of the end, so
+          // hand over from the current end rather than wherever this stopped.
+          if (!savedRow && element) {
+            void list.scrollToOffset({
+              offset: Math.max(0, element.scrollHeight - element.clientHeight),
+              animated: false,
+            });
+          }
           setPositionedThreadKey(listIdentityKey);
           return;
         }
         const state = list.getState();
         const rowIndex = savedRow ? state.indexByKey(savedRow.rowId) : undefined;
         const row = rowIndex === undefined ? undefined : state.elementAtIndex(rowIndex);
-        const element = list.getScrollableNode();
         // The saved row can mount a frame after the estimated scroll.
         if (!element || (savedRow && !row)) {
           settleFrame = requestAnimationFrame(reconcile);
@@ -920,9 +936,10 @@ export const MessagesTimeline = memo(function MessagesTimeline({
     listIdentityKey,
     listRef,
     onManualNavigation,
+    hasRows,
     rememberedPosition,
+    restoreRowIndex,
     restoringThreadPosition,
-    rows,
   ]);
 
   const [timelineViewportElement, setTimelineViewportElement] = useState<HTMLDivElement | null>(

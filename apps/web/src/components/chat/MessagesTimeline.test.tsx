@@ -1225,38 +1225,48 @@ describe("MessagesTimeline", () => {
         frames.clear();
         callbacks.forEach((callback) => callback(0));
       });
-    const entries = [
-      {
-        id: "entry-restore-work",
-        kind: "work" as const,
+    const workEntry = (index: number) => ({
+      id: `entry-restore-work-${index}`,
+      kind: "work" as const,
+      createdAt: MESSAGE_CREATED_AT,
+      entry: {
+        id: `work-restore-${index}`,
         createdAt: MESSAGE_CREATED_AT,
-        entry: {
-          id: "work-restore",
-          createdAt: MESSAGE_CREATED_AT,
-          toolCallId: "call-restore",
-          label: "Run lint",
-          tone: "tool" as const,
-          itemType: "command_execution" as const,
-          command: "pnpm lint",
-          toolLifecycleStatus: "completed" as const,
-        },
+        toolCallId: `call-restore-${index}`,
+        label: "Run lint",
+        tone: "tool" as const,
+        itemType: "command_execution" as const,
+        command: "pnpm lint",
+        toolLifecycleStatus: "completed" as const,
       },
-    ];
+    });
+    let entries = [workEntry(0)];
     const noop = () => {};
+    const listeners = new Map<string, () => void>();
     const viewport = {
       scrollTop: 0,
       scrollHeight: 2000,
       clientHeight: 800,
       getBoundingClientRect: () => ({ top: 0 }),
-      addEventListener: noop,
-      removeEventListener: noop,
+      addEventListener: (type: string, listener: () => void) => listeners.set(type, listener),
+      removeEventListener: (type: string) => listeners.delete(type),
       ownerDocument: { addEventListener: noop, removeEventListener: noop },
     };
-    const harness = { viewport, rowMounted: true, atEndCalls: [] as boolean[], flushFrame };
+    const harness = {
+      viewport,
+      listeners,
+      rowMounted: true,
+      atEndCalls: [] as boolean[],
+      manualNavigations: 0,
+      flushFrame,
+    };
     const props = {
       ...buildProps(),
       routeThreadKey: "env-restore:thread-0",
       onIsAtEndChange: (isAtEnd: boolean) => harness.atEndCalls.push(isAtEnd),
+      onManualNavigation: () => {
+        harness.manualNavigations += 1;
+      },
     };
     const scrollTo = (offset: number) => {
       viewport.scrollTop = offset;
@@ -1270,11 +1280,15 @@ describe("MessagesTimeline", () => {
         scrollLength: viewport.clientHeight,
         positionAtIndex: () => 0,
         indexByKey: () => 0,
+        // The saved row starts 100px down the content.
         elementAtIndex: () =>
-          harness.rowMounted ? { getBoundingClientRect: () => ({ top: 0 }) } : null,
+          harness.rowMounted
+            ? { getBoundingClientRect: () => ({ top: 100 - viewport.scrollTop }) }
+            : null,
       }),
       getScrollableNode: () => viewport,
-      scrollToEnd: () => scrollTo(viewport.scrollHeight - viewport.clientHeight),
+      // Jumps to the end as estimated before rows measure, which lands short.
+      scrollToEnd: () => scrollTo(300),
       scrollToIndex: () => Promise.resolve(),
       scrollToOffset: ({ offset }: { offset: number }) => scrollTo(offset),
     } as unknown as LegendListRef;
@@ -1288,19 +1302,27 @@ describe("MessagesTimeline", () => {
       scrollOffset: 0,
       atEnd,
     });
+    const renderThread1 = () =>
+      act(async () => {
+        renderer.update(
+          <MessagesTimeline
+            {...props}
+            routeThreadKey="env-restore:thread-1"
+            timelineEntries={entries}
+          />,
+        );
+      });
     return {
       harness,
       async switchThread() {
-        await act(async () => {
-          renderer.update(
-            <MessagesTimeline
-              {...props}
-              routeThreadKey="env-restore:thread-1"
-              timelineEntries={entries}
-            />,
-          );
-        });
+        await renderThread1();
         harness.atEndCalls.length = 0;
+        harness.manualNavigations = 0;
+      },
+      async streamRow() {
+        entries = [...entries, workEntry(entries.length)];
+        viewport.scrollHeight += 100;
+        await renderThread1();
       },
       cleanup() {
         act(() => renderer.unmount());
@@ -1318,6 +1340,7 @@ describe("MessagesTimeline", () => {
       harness.rowMounted = true;
       for (let frame = 0; frame < 4; frame += 1) await harness.flushFrame();
 
+      expect(harness.viewport.scrollTop).toBe(100);
       // Restore finished, so scroll reporting (and with it the pill) resumed.
       expect(harness.atEndCalls).toContain(false);
     } finally {
@@ -1329,13 +1352,48 @@ describe("MessagesTimeline", () => {
     const { harness, switchThread, cleanup } = await switchToRememberedThread(true);
     try {
       await switchThread();
-      expect(harness.viewport.scrollTop).toBe(1200);
+      expect(harness.viewport.scrollTop).toBe(300);
       // Estimated rows measure taller after the first jump to the end.
       harness.viewport.scrollHeight = 5000;
       for (let frame = 0; frame < 6; frame += 1) await harness.flushFrame();
 
       expect(harness.viewport.scrollTop).toBe(4200);
       expect(harness.atEndCalls).toContain(true);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("hands a thread that streams through its restore to end maintenance at the end", async () => {
+    const { harness, switchThread, streamRow, cleanup } = await switchToRememberedThread(true);
+    try {
+      await switchThread();
+      // A row streams in every frame, so the restore never sees two stable frames.
+      for (let frame = 0; frame < 40 && harness.atEndCalls.length === 0; frame += 1) {
+        await streamRow();
+        await harness.flushFrame();
+      }
+
+      // Restore finished, so scroll reporting resumed, after handing over from
+      // the end. This double has no end maintenance, so only the one row that
+      // streamed after the hand-over jump sits below.
+      expect(harness.atEndCalls.length).toBeGreaterThan(0);
+      const { scrollTop, scrollHeight, clientHeight } = harness.viewport;
+      expect(scrollHeight - clientHeight - scrollTop).toBe(100);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("keeps following when a gesture interrupts a restore to the end", async () => {
+    const { harness, switchThread, cleanup } = await switchToRememberedThread(true);
+    try {
+      await switchThread();
+      act(() => harness.listeners.get("wheel")?.());
+
+      // ChatView's own listeners decide whether the gesture leaves the end.
+      expect(harness.manualNavigations).toBe(0);
+      expect(harness.listeners.has("wheel")).toBe(false);
     } finally {
       cleanup();
     }

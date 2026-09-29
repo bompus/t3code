@@ -5840,11 +5840,13 @@ export default function ChatView(props: ChatViewProps) {
   // State mirror of the follow mode refs. LegendList's maintainScrollAtEnd
   // re-pins on its own (independent of the refs), so the timeline needs a
   // render-visible flag to switch it off once the user scrolls away.
-  const [timelineLiveFollowEnabled, setTimelineLiveFollowEnabled] = useState(true);
+  const [timelineLiveFollowEnabled, setTimelineLiveFollowEnabled] = useState(
+    () => readTimelinePosition(routeThreadKey)?.atEnd !== false,
+  );
   // Reset during the switching render, not in an effect: the timeline
   // measures the new thread's rows in its first commit, and a flag left over
   // from the previous thread would switch end maintenance off for them.
-  const [liveFollowThreadKey, setLiveFollowThreadKey] = useState<string | null>(null);
+  const [liveFollowThreadKey, setLiveFollowThreadKey] = useState(routeThreadKey);
   if (liveFollowThreadKey !== routeThreadKey) {
     setLiveFollowThreadKey(routeThreadKey);
     setTimelineLiveFollowEnabled(readTimelinePosition(routeThreadKey)?.atEnd !== false);
@@ -6322,6 +6324,7 @@ export default function ChatView(props: ChatViewProps) {
     liveFollowUserScrollGenerationRef.current = followEnd
       ? anchorUserScrollGenerationRef.current
       : null;
+    setTimelineLiveFollowEnabled(followEnd);
     pendingTimelineAnchorRef.current = null;
     positionedTimelineAnchorRef.current = null;
     settledTimelineAnchorRef.current = null;
