@@ -893,7 +893,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
           settleFrame = requestAnimationFrame(reconcile);
           return;
         }
-        const endOffset = element.scrollHeight - element.clientHeight;
+        const endOffset = Math.max(0, element.scrollHeight - element.clientHeight);
         const offset =
           savedRow && row
             ? Math.max(
