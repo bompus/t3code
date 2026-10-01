@@ -236,7 +236,10 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
 
   const dispatchNotification = (notification: AcpIncomingNotification) =>
     Effect.sync(() => {
-      const bytes = encodeRawNotification(notification).length * 2;
+      // Measure the wire payload, not the internal wrapper: `_tag` is longer than
+      // `jsonrpc`, so a maximum-size line would otherwise overflow the budget.
+      const bytes =
+        (notification.method.length + encodeRawNotification(notification.params).length) * 2;
       while (
         notifications.length > 0 &&
         (notifications.length >= MAX_BUFFERED_RAW_NOTIFICATIONS ||

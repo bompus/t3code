@@ -224,6 +224,26 @@ it.layer(NodeServices.layer)("effect-acp protocol", (it) => {
     }),
   );
 
+  it.effect("buffers a raw notification at the maximum wire size", () =>
+    Effect.gen(function* () {
+      const { stdio, input } = yield* makeInMemoryStdio();
+      const transport = yield* AcpProtocol.makeAcpPatchedProtocol({
+        stdio,
+        serverRequestMethods: new Set(),
+      });
+      const wrapper = encodeUnknownJsonString({ jsonrpc: "2.0", method: "x/max", params: "" });
+      const line = encodeUnknownJsonString({
+        jsonrpc: "2.0",
+        method: "x/max",
+        params: "x".repeat(64 * 1024 * 1024 - wrapper.length),
+      });
+      assert.equal(line.length, 64 * 1024 * 1024);
+      yield* Queue.offer(input, encoder.encode(`${line}\n`));
+      const [received] = yield* transport.incoming.pipe(Stream.take(1), Stream.runCollect);
+      assert.equal(received?.method, "x/max");
+    }),
+  );
+
   it.effect("wakes concurrent raw notification consumers", () =>
     Effect.gen(function* () {
       const { stdio, input } = yield* makeInMemoryStdio();
