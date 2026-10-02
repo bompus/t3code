@@ -17,24 +17,24 @@ describe("relay client install dialog coordinator", () => {
   });
 
   it("moves a confirmed installation through streamed progress stages", async () => {
-    const confirmation = requestRelayClientInstallConfirmation("2026.9.1");
+    const confirmation = requestRelayClientInstallConfirmation("2026.9.3");
     expect(readRelayClientInstallDialogState()).toEqual({
       status: "confirming",
-      version: "2026.9.1",
+      version: "2026.9.3",
     });
 
     respondToRelayClientInstallConfirmation(true);
     await expect(confirmation).resolves.toBe(true);
     expect(readRelayClientInstallDialogState()).toEqual({
       status: "installing",
-      version: "2026.9.1",
+      version: "2026.9.3",
       stage: "checking",
     });
 
     reportRelayClientInstallProgress({ type: "progress", stage: "downloading" });
     expect(readRelayClientInstallDialogState()).toEqual({
       status: "installing",
-      version: "2026.9.1",
+      version: "2026.9.3",
       stage: "downloading",
     });
 
@@ -43,7 +43,7 @@ describe("relay client install dialog coordinator", () => {
       status: "closing",
       view: {
         status: "installing",
-        version: "2026.9.1",
+        version: "2026.9.3",
         stage: "downloading",
       },
     });
@@ -53,7 +53,7 @@ describe("relay client install dialog coordinator", () => {
   });
 
   it("returns to idle when installation is declined", async () => {
-    const confirmation = requestRelayClientInstallConfirmation("2026.9.1");
+    const confirmation = requestRelayClientInstallConfirmation("2026.9.3");
     respondToRelayClientInstallConfirmation(false);
 
     await expect(confirmation).resolves.toBe(false);
@@ -61,7 +61,7 @@ describe("relay client install dialog coordinator", () => {
       status: "closing",
       view: {
         status: "confirming",
-        version: "2026.9.1",
+        version: "2026.9.3",
       },
     });
 
@@ -70,7 +70,7 @@ describe("relay client install dialog coordinator", () => {
   });
 
   it("rejects concurrent confirmation with the active install state", async () => {
-    const confirmation = requestRelayClientInstallConfirmation("2026.9.1");
+    const confirmation = requestRelayClientInstallConfirmation("2026.9.3");
     respondToRelayClientInstallConfirmation(true);
     await expect(confirmation).resolves.toBe(true);
     reportRelayClientInstallProgress({ type: "progress", stage: "downloading" });
@@ -83,13 +83,13 @@ describe("relay client install dialog coordinator", () => {
     expect(error).toBeInstanceOf(RelayClientInstallConfirmationConflictError);
     expect(error).toMatchObject({
       requestedVersion: "2026.10.0",
-      activeVersion: "2026.9.1",
+      activeVersion: "2026.9.3",
       activeDialogStatus: "installing",
       activeInstallStage: "downloading",
     });
     expect(error).not.toHaveProperty("cause");
     expect((error as Error).message).toBe(
-      "Cannot confirm relay client installation 2026.10.0; installation 2026.9.1 has dialog status installing.",
+      "Cannot confirm relay client installation 2026.10.0; installation 2026.9.3 has dialog status installing.",
     );
   });
 });
