@@ -820,13 +820,13 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       if (viewport) void list.scrollToOffset({ offset: viewport.scrollTop, animated: false });
       setPositionedThreadKey(listIdentityKey);
     };
-    const position = rememberedPosition;
+    const savedRow = rememberedPosition?.atEnd === false ? rememberedPosition : null;
     // A restore to the end only stops correcting on a gesture. ChatView's own
     // listeners decide whether that gesture leaves the end, so a wheel down
     // or a click at the bottom keeps following.
     const cancelForNavigation = () => {
       cancelRestoration();
-      if (position?.atEnd === false) onManualNavigation();
+      if (savedRow) onManualNavigation();
     };
     const onScrollKey = (event: globalThis.KeyboardEvent) => {
       if (
@@ -842,26 +842,24 @@ export const MessagesTimeline = memo(function MessagesTimeline({
     viewport?.addEventListener("touchmove", cancelForNavigation, { passive: true });
     viewport?.addEventListener("pointerdown", cancelForNavigation, { passive: true });
     viewport?.ownerDocument.addEventListener("keydown", onScrollKey);
-    if (position?.atEnd === false) onManualNavigation();
+    if (savedRow) onManualNavigation();
     if (cancelPositionRestoreRef) cancelPositionRestoreRef.current = cancelRestoration;
-    const scrolling =
-      position?.atEnd === false
-        ? restoreRowIndex >= 0
-          ? list.scrollToIndex({
-              index: restoreRowIndex,
-              animated: false,
-              viewPosition: 0,
-              viewOffset: -position.offsetWithinRow,
-            })
-          : list.scrollToOffset({ offset: position.scrollOffset, animated: false })
-        : list.scrollToEnd({ animated: false });
+    const scrolling = savedRow
+      ? restoreRowIndex >= 0
+        ? list.scrollToIndex({
+            index: restoreRowIndex,
+            animated: false,
+            viewPosition: 0,
+            viewOffset: -savedRow.offsetWithinRow,
+          })
+        : list.scrollToOffset({ offset: savedRow.scrollOffset, animated: false })
+      : list.scrollToEnd({ animated: false });
     void Promise.resolve(scrolling).then(() => {
       if (cancelled) return;
-      if (position?.atEnd === false && restoreRowIndex < 0) {
+      if (savedRow && restoreRowIndex < 0) {
         setPositionedThreadKey(listIdentityKey);
         return;
       }
-      const savedRow = position?.atEnd === false ? position : null;
       // Scrolling starts from estimated row sizes, so the first jump lands
       // short once real rows measure. Keep correcting toward the target (the
       // saved row, or the end) until it and the DOM agree for two frames.
@@ -870,40 +868,30 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       const reconcile = () => {
         if (cancelled) return;
         const element = list.getScrollableNode();
+        const endOffset = element ? Math.max(0, element.scrollHeight - element.clientHeight) : 0;
         if (++frames > THREAD_RESTORE_MAX_FRAMES) {
           // End maintenance only re-pins within a viewport of the end, so
           // hand over from the current end rather than wherever this stopped.
-          if (!savedRow && element) {
-            void list.scrollToOffset({
-              offset: Math.max(0, element.scrollHeight - element.clientHeight),
-              animated: false,
-            });
-          }
+          if (!savedRow && element)
+            void list.scrollToOffset({ offset: endOffset, animated: false });
           setPositionedThreadKey(listIdentityKey);
           return;
         }
-        const state = list.getState();
-        const rowIndex = savedRow ? state.indexByKey(savedRow.rowId) : undefined;
-        const row = rowIndex === undefined ? undefined : state.elementAtIndex(rowIndex);
+        // The effect restarts when the saved row's index changes.
+        const row = savedRow ? list.getState().elementAtIndex(restoreRowIndex) : null;
         // The saved row can mount a frame after the estimated scroll.
         if (!element || (savedRow && !row)) {
           settleFrame = requestAnimationFrame(reconcile);
           return;
         }
-        const endOffset = Math.max(0, element.scrollHeight - element.clientHeight);
-        const offset =
+        const target =
           savedRow && row
-            ? Math.max(
-                0,
-                Math.min(
-                  element.scrollTop +
-                    row.getBoundingClientRect().top -
-                    element.getBoundingClientRect().top +
-                    savedRow.offsetWithinRow,
-                  endOffset,
-                ),
-              )
+            ? element.scrollTop +
+              row.getBoundingClientRect().top -
+              element.getBoundingClientRect().top +
+              savedRow.offsetWithinRow
             : endOffset;
+        const offset = Math.max(0, Math.min(target, endOffset));
         if (Math.abs(element.scrollTop - offset) > 1) {
           stableFrames = 0;
           void list.scrollToOffset({ offset, animated: false }).then(() => {
