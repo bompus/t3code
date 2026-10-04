@@ -193,6 +193,61 @@ it.layer(NodeServices.layer)("Android clean prebuild", (it) => {
     }),
   );
 
+  it.effect("preserves the original failure when cache recovery also fails", () =>
+    Effect.gen(function* () {
+      for (const phase of ["prebuild", "save"]) {
+        const { fs, mobile, file, regenerate, path } = yield* fixture;
+        const saveFailure = PlatformError.systemError({
+          _tag: "PermissionDenied",
+          module: "FileSystem",
+          method: "rename",
+          description: "save failed",
+        });
+        const original =
+          phase === "prebuild"
+            ? new NativeClientError({ message: "prebuild failed" })
+            : saveFailure;
+        const restoreFailure = PlatformError.systemError({
+          _tag: "PermissionDenied",
+          module: "FileSystem",
+          method: "rename",
+          description: "restore failed",
+        });
+        const failingFs = {
+          ...fs,
+          rename: (source: string, target: string) =>
+            target === file(".gradle")
+              ? Effect.fail(restoreFailure)
+              : phase === "save" && source === file("app/.cxx")
+                ? Effect.fail(saveFailure)
+                : fs.rename(source, target),
+        };
+        const error = yield* prebuildAndroid(
+          mobile,
+          regenerate.pipe(Effect.andThen(Effect.fail(original))),
+        ).pipe(Effect.provideService(FileSystem.FileSystem, failingFs), Effect.flip);
+        assert.strictEqual(error, original);
+        const saved = (yield* fs.readDirectory(mobile)).find((name) =>
+          name.startsWith(".android-prebuild-"),
+        );
+        assert.isDefined(saved);
+        const recovery = path.join(mobile, saved!);
+        assert.strictEqual(
+          yield* fs.readFileString(path.join(recovery, ".gradle/history")),
+          ".gradle/history",
+        );
+        assert.isTrue(
+          (yield* TestConsole.errorLines).some(
+            (line) =>
+              typeof line === "string" &&
+              line.includes(recovery) &&
+              line.includes("restore failed"),
+          ),
+        );
+      }
+    }).pipe(Effect.provide(TestConsole.layer)),
+  );
+
   it.effect("restores saved outputs when prebuild is interrupted", () =>
     Effect.gen(function* () {
       const { fs, mobile, file, regenerate } = yield* fixture;

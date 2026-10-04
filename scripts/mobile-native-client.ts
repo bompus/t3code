@@ -333,7 +333,7 @@ export const prebuildAndroid = Effect.fn("nativeClient.prebuildAndroid")(functio
           yield* restore(prebuild);
         }),
       );
-      yield* Effect.gen(function* () {
+      const recovered = yield* Effect.gen(function* () {
         for (const cache of caches) {
           const source = path.join(saved, cache);
           if (!(yield* fs.exists(source))) continue;
@@ -361,9 +361,11 @@ export const prebuildAndroid = Effect.fn("nativeClient.prebuildAndroid")(functio
         // Pending interruption can suppress the returned error when the mask ends.
         // Print the recovery path before leaving uninterruptible cleanup.
         Effect.tapError((error) => Console.error(error.message)),
+        Effect.exit,
       );
-      yield* fs.remove(saved, { recursive: true });
+      if (Exit.isSuccess(recovered)) yield* fs.remove(saved, { recursive: true });
       if (Exit.isFailure(result)) return yield* Effect.failCause(result.cause);
+      if (Exit.isFailure(recovered)) return yield* Effect.failCause(recovered.cause);
     }),
   );
 });
