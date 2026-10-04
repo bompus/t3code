@@ -9925,9 +9925,13 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   const dispatchWithReceipt = (command: OrchestrationV2ServerCommand) =>
     threadDispatch.withLock(commandThreadId(command), dispatchWithReceiptEffect(command));
 
-  const handleTerminalRun = (stored: OrchestrationV2StoredEvent) =>
+  const handleRunQueueTrigger = (stored: OrchestrationV2StoredEvent) =>
     Effect.gen(function* () {
       const threadId = stored.event.threadId;
+      if (stored.event.type === "run.updated" && stored.event.payload.status === "queued") {
+        yield* threadDispatch.withLock(threadId, startNextQueuedRun(threadId));
+        return;
+      }
       // finalize writes the parent thread and startNextQueuedRun writes this
       // thread, so each takes its own thread's lock, sequentially and never
       // nested: dispatchDelegatedTaskRequest already writes child events
@@ -9955,7 +9959,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       );
     }).pipe(
       Effect.catchCause((cause) =>
-        Effect.logWarning("Failed to react to terminal V2 run", {
+        Effect.logWarning("Failed to react to V2 run queue trigger", {
           threadId: stored.event.threadId,
           sequence: stored.sequence,
           cause,
@@ -9963,31 +9967,31 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       ),
     );
 
-  // Historical terminal events are already represented by the projections
+  // Historical run updates are already represented by the projections
   // below. Replaying the full event table on every server start delays live
   // queue promotion in proportion to the lifetime size of the database.
-  const terminalEventsAfterSequence = yield* eventSink.latestSequence().pipe(Effect.orDie);
+  const runEventsAfterSequence = yield* eventSink.latestSequence().pipe(Effect.orDie);
   // Queue promotion can wait on a provider or a thread lock. Subscribe to run
   // updates before buffering so that wait never retains unrelated tool bodies.
-  yield* eventSink
-    .stream({ afterSequence: terminalEventsAfterSequence, eventType: "run.updated" })
-    .pipe(
-      Stream.filter(
-        (stored) =>
-          stored.event.type === "run.updated" &&
-          !String(stored.commandId).startsWith("command:runtime-reconcile:") &&
-          (stored.event.payload.status === "completed" ||
-            stored.event.payload.status === "interrupted" ||
-            stored.event.payload.status === "failed" ||
-            stored.event.payload.status === "cancelled" ||
-            stored.event.payload.status === "rolled_back"),
-      ),
-      Stream.runForEach(handleTerminalRun),
-      Effect.forkDetach,
-    );
+  yield* eventSink.stream({ afterSequence: runEventsAfterSequence, eventType: "run.updated" }).pipe(
+    Stream.filter(
+      (stored) =>
+        stored.event.type === "run.updated" &&
+        !String(stored.commandId).startsWith("command:runtime-reconcile:") &&
+        (stored.event.payload.status === "completed" ||
+          stored.event.payload.status === "interrupted" ||
+          stored.event.payload.status === "failed" ||
+          stored.event.payload.status === "cancelled" ||
+          stored.event.payload.status === "rolled_back" ||
+          (stored.event.payload.status === "queued" &&
+            stored.event.payload.backgroundDeferrals !== undefined)),
+    ),
+    Stream.runForEach(handleRunQueueTrigger),
+    Effect.forkDetach,
+  );
 
   yield* eventSink
-    .stream({ afterSequence: terminalEventsAfterSequence, eventType: "runtime-request.updated" })
+    .stream({ afterSequence: runEventsAfterSequence, eventType: "runtime-request.updated" })
     .pipe(
       Stream.filter(
         (stored) =>

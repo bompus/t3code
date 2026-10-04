@@ -49,6 +49,7 @@ import * as ProjectService from "../project/ProjectService.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as McpSessionRegistryTestkit from "../mcp/McpSessionRegistry.testkit.ts";
 import * as ProviderInstanceRegistry from "../provider/Services/ProviderInstanceRegistry.ts";
+import * as ProviderAuthService from "../provider/Services/ProviderAuthService.ts";
 import type { ProviderInstance } from "../provider/ProviderDriver.ts";
 import * as VcsDriverRegistry from "../vcs/VcsDriverRegistry.ts";
 import * as VcsProcess from "../vcs/VcsProcess.ts";
@@ -62,6 +63,10 @@ import * as RuntimeRequestService from "./RuntimeRequestService.ts";
 import * as CheckpointRollbackService from "./CheckpointRollbackService.ts";
 import * as RunFinalizationService from "./RunFinalizationService.ts";
 import * as ProviderTurnStartService from "./ProviderTurnStartService.ts";
+import * as ContextHandoffService from "./ContextHandoffService.ts";
+import * as IdAllocator from "./IdAllocator.ts";
+import * as RunExecutionService from "./RunExecutionService.ts";
+import * as RuntimePolicy from "./RuntimePolicy.ts";
 import * as ProviderTurnControlService from "./ProviderTurnControlService.ts";
 import * as EffectOutbox from "./EffectOutbox.ts";
 import * as EventSink from "./EventSink.ts";
@@ -746,6 +751,88 @@ it.layer(TestLayer)("background message delivery", (it) => {
           [],
         );
       }),
+  );
+
+  // All three orderings with a question before deferral; the human message
+  // can arrive before either event, between them, or after both.
+  it.effect.each([
+    { order: "human → question → defer", events: ["human", "question", "defer"] },
+    { order: "question → human → defer", events: ["question", "human", "defer"] },
+    { order: "question → defer → human", events: ["question", "defer", "human"] },
+  ])("promotes waiting human work after mail deferral: $order", ({ events }) =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const sink = yield* EventSink.EventSinkV2;
+      const threadId = ThreadId.make(`background-deferral-wake-${events.join("-")}`);
+      yield* create(threadId);
+      const delivered = yield* mail(threadId);
+      assert.equal(delivered.run.status, "starting");
+      const ordinaryMessageId = MessageId.make(`${threadId}-human`);
+      const promoted = yield* Deferred.make<void>();
+      const afterSequence = yield* orchestrator.getThreadEventSequence(threadId);
+      yield* sink.stream({ threadId, afterSequence }).pipe(
+        Stream.runForEach((stored) =>
+          (stored.event.type === "run.created" || stored.event.type === "run.updated") &&
+          stored.event.payload.userMessageId === ordinaryMessageId &&
+          stored.event.payload.status === "starting"
+            ? Deferred.succeed(promoted, undefined)
+            : Effect.void,
+        ),
+        Effect.forkScoped,
+      );
+      const startLayer = ProviderTurnStartService.layer.pipe(
+        Layer.provide(
+          Layer.mergeAll(
+            IdAllocator.layer,
+            PlatformTestLayer,
+            GitWorkflowTestLayer,
+            ProjectServiceTestLayer,
+            Layer.mock(ContextHandoffService.ContextHandoffServiceV2)({}),
+            Layer.mock(ProviderAuthService.ProviderAuthService)({}),
+            Layer.mock(RunExecutionService.RunExecutionServiceV2)({}),
+            Layer.mock(RuntimePolicy.RuntimePolicyV2)({}),
+          ),
+        ),
+      );
+      for (const event of events) {
+        if (event === "question") {
+          yield* seedBackgroundQuestion(String(threadId), threadId);
+        } else if (event === "human") {
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            commandId: CommandId.make(`${threadId}-human`),
+            threadId,
+            messageId: ordinaryMessageId,
+            text: "Human follow-up",
+            attachments: [],
+            dispatchMode: { type: "queue_after_active" },
+            createdBy: "user",
+            creationSource: "web",
+          });
+        } else {
+          yield* Effect.flatMap(ProviderTurnStartService.ProviderTurnStartServiceV2, (start) =>
+            start.start({ threadId, runId: delivered.run.id }),
+          ).pipe(Effect.provide(startLayer));
+        }
+      }
+      yield* Deferred.await(promoted);
+      const after = yield* orchestrator.getThreadProjection(threadId);
+      assert.equal(
+        after.runs.find((run) => run.userMessageId === ordinaryMessageId)?.status,
+        "starting",
+      );
+      const deferredMail = after.runs.find((run) => run.id === delivered.run.id);
+      assert.equal(deferredMail?.status, "queued");
+      assert.equal(deferredMail?.backgroundDeferrals, 1);
+      assert.equal(
+        after.runtimeRequests.find((request) => request.id === `${threadId}-question`)?.status,
+        "pending",
+      );
+      assert.lengthOf(
+        after.messages.filter((message) => message.id === delivered.message.id),
+        1,
+      );
+    }),
   );
 
   it.effect("gives repeated deferred promotions distinct durable start effects", () =>
