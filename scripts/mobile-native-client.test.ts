@@ -51,6 +51,49 @@ it.layer(NodeServices.layer)("Android clean prebuild", (it) => {
       }),
   );
 
+  it.effect("leaves caches behind symlinked directories at their original targets", () =>
+    Effect.gen(function* () {
+      for (const [relative, cache] of [
+        ["", "app/.cxx/object"],
+        ["app", ".cxx/object"],
+        ["app/.cxx", "object"],
+        [".gradle", "history"],
+      ] as const) {
+        const { fs, mobile, file, regenerate, path } = yield* fixture;
+        const external = path.join(mobile, "external");
+        const source = file(relative);
+        yield* fs.rename(source, external);
+        yield* fs.symlink(external, source);
+        const cacheFile = path.join(external, cache);
+        const before = yield* fs.readFileString(cacheFile);
+        yield* prebuildAndroid(mobile, regenerate);
+        assert.strictEqual(yield* fs.readFileString(cacheFile), before);
+        assert.deepStrictEqual((yield* fs.readDirectory(mobile)).sort(), ["android", "external"]);
+      }
+    }),
+  );
+
+  it.effect("retains saved outputs when regeneration creates a symlinked cache parent", () =>
+    Effect.gen(function* () {
+      const { fs, mobile, file, regenerate, path } = yield* fixture;
+      const external = path.join(mobile, "external");
+      yield* fs.makeDirectory(external);
+      const linked = regenerate.pipe(Effect.andThen(fs.symlink(external, file("app"))));
+      const error = yield* prebuildAndroid(mobile, linked).pipe(Effect.flip);
+      const saved = (yield* fs.readDirectory(mobile)).find((name) =>
+        name.startsWith(".android-prebuild-"),
+      );
+      assert.isDefined(saved);
+      const recovery = path.join(mobile, saved!);
+      assert.include(error.message, recovery);
+      assert.strictEqual(
+        yield* fs.readFileString(path.join(recovery, "app/.cxx/object")),
+        "app/.cxx/object",
+      );
+      assert.deepStrictEqual(yield* fs.readDirectory(external), []);
+    }),
+  );
+
   it.effect("restores saved outputs when clean regeneration fails", () =>
     Effect.gen(function* () {
       const { fs, mobile, file, regenerate } = yield* fixture;

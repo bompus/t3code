@@ -316,7 +316,13 @@ export const prebuildAndroid = Effect.fn("nativeClient.prebuildAndroid")(functio
         Effect.gen(function* () {
           for (const cache of caches) {
             const source = path.join(android, cache);
-            if (!(yield* fs.exists(source)) || (yield* readLink(source)) !== null) continue;
+            if (
+              (yield* readLink(android)) !== null ||
+              (yield* readLink(path.dirname(source))) !== null ||
+              !(yield* fs.exists(source)) ||
+              (yield* readLink(source)) !== null
+            )
+              continue;
             if ((yield* fs.stat(source)).type !== "Directory") continue;
             const target = path.join(saved, cache);
             yield* fs.makeDirectory(path.dirname(target), { recursive: true });
@@ -332,7 +338,12 @@ export const prebuildAndroid = Effect.fn("nativeClient.prebuildAndroid")(functio
           const source = path.join(saved, cache);
           if (!(yield* fs.exists(source))) continue;
           const target = path.join(android, cache);
-          if ((yield* fs.exists(target)) || (yield* readLink(target)) !== null) {
+          if (
+            (yield* readLink(android)) !== null ||
+            (yield* readLink(path.dirname(target))) !== null ||
+            (yield* fs.exists(target)) ||
+            (yield* readLink(target)) !== null
+          ) {
             return yield* new NativeClientError({
               message: `Cannot restore native cache over ${target}.`,
             });
