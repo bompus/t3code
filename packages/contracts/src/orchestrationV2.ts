@@ -545,6 +545,8 @@ export const OrchestrationV2Run = Schema.Struct({
   queuePosition: Schema.optional(Schema.NullOr(PositiveInt)),
   /** Restart recovery holds the queue until the user explicitly resumes it. */
   queueHeld: Schema.optional(Schema.Boolean),
+  /** Distinguishes start effects after a background run is deferred before native delivery. */
+  backgroundDeferrals: Schema.optional(PositiveInt),
   requestedAt: Schema.DateTimeUtc,
   startedAt: Schema.NullOr(Schema.DateTimeUtc),
   completedAt: Schema.NullOr(Schema.DateTimeUtc),
@@ -1052,6 +1054,8 @@ export const OrchestrationV2Notification = Schema.Struct({
 export type OrchestrationV2Notification = typeof OrchestrationV2Notification.Type;
 
 export const OrchestrationV2ConversationMessage = Schema.Struct({
+  /** Background delivery preserves human requests and never interrupts a provider turn. */
+  backgroundDelivery: Schema.optional(Schema.Literal(true)),
   notification: Schema.optional(OrchestrationV2Notification),
   ...OrchestrationV2CreationFields,
   scheduledTaskId: Schema.optional(ScheduledTaskId),
@@ -2721,7 +2725,7 @@ export const OrchestrationV2Command = Schema.Union([
     manualContinuationOfRunId: Schema.optional(RunId),
     usageLimitRecoveryRequestId: Schema.optional(CommandId),
     /** Resolve untargeted delivery against the server's serialized thread state. */
-    deliveryIntent: Schema.optional(Schema.Literals(["auto", "steer", "restart"])),
+    deliveryIntent: Schema.optional(Schema.Literals(["auto", "steer", "restart", "background"])),
     delegatedCompletion: Schema.optional(
       Schema.Struct({
         parentRunId: RunId,

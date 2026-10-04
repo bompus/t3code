@@ -47,6 +47,8 @@ import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 import { makeProviderFailure } from "./ProviderFailure.ts";
 import * as RunExecutionService from "./RunExecutionService.ts";
 import * as RuntimePolicy from "./RuntimePolicy.ts";
+import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
+import { hasPendingHumanRequest } from "./CommandPolicy.ts";
 import {
   isRestartNoteContinuation,
   pendingRestartCancelledBackgroundWork,
@@ -95,6 +97,7 @@ export const layer: Layer.Layer<
   | ProviderSessionManager.ProviderSessionManagerV2
   | RunExecutionService.RunExecutionServiceV2
   | RuntimePolicy.RuntimePolicyV2
+  | ThreadCommandExecutor.ThreadCommandExecutor
 > = Layer.effect(
   ProviderTurnStartServiceV2,
   Effect.gen(function* () {
@@ -109,6 +112,89 @@ export const layer: Layer.Layer<
     const providerSessions = yield* ProviderSessionManager.ProviderSessionManagerV2;
     const runExecution = yield* RunExecutionService.RunExecutionServiceV2;
     const runtimePolicy = yield* RuntimePolicy.RuntimePolicyV2;
+    const threadCommands = yield* ThreadCommandExecutor.ThreadCommandExecutor;
+
+    // Only called before native delivery. Requeue the unstarted run rather than leaving
+    // it active while a human answer needs to start its own turn.
+    const deferBackgroundRun = (threadId: ThreadId, runId: RunId) =>
+      threadCommands
+        .withLock(
+          threadId,
+          Effect.gen(function* () {
+            const current = yield* projectionStore.getThreadRecords(threadId, [
+              "runs",
+              "nodes",
+              "attempts",
+              "runtimeRequests",
+            ]);
+            const run = current.runs.find((row) => row.id === runId);
+            if (
+              run === undefined ||
+              (run.status !== "starting" && run.status !== "running") ||
+              !hasPendingHumanRequest(current.runtimeRequests)
+            )
+              return false;
+            const node = current.nodes.find((row) => row.id === run.rootNodeId);
+            const attempt = current.attempts.find((row) => row.id === run.activeAttemptId);
+            if (node === undefined || attempt === undefined)
+              return yield* new ProjectionStore.ProjectionStoreReadError({
+                threadId,
+                cause: "Background run has no unstarted execution identity.",
+              });
+            const now = yield* DateTime.now;
+            const payloads = [
+              {
+                type: "run.updated" as const,
+                payload: {
+                  ...run,
+                  status: "queued" as const,
+                  startedAt: null,
+                  queuePosition:
+                    Math.max(
+                      0,
+                      ...current.runs
+                        .filter((row) => row.status === "queued")
+                        .map((row) => row.queuePosition ?? row.ordinal),
+                    ) + 1,
+                  backgroundDeferrals: (run.backgroundDeferrals ?? 0) + 1,
+                },
+              },
+              {
+                type: "run-attempt.updated" as const,
+                payload: { ...attempt, status: "pending" as const, startedAt: null },
+              },
+              {
+                type: "node.updated" as const,
+                payload: { ...node, status: "pending" as const, startedAt: null },
+              },
+            ];
+            const events = yield* Effect.forEach(payloads, (event) =>
+              Effect.gen(function* () {
+                return {
+                  ...event,
+                  id: yield* idAllocator.allocate.event({ threadId }),
+                  threadId,
+                  runId,
+                  nodeId: node.id,
+                  occurredAt: now,
+                };
+              }),
+            );
+            const result = yield* eventSink.writeIfRunCurrent({
+              threadId,
+              runId,
+              activeAttemptId: attempt.id,
+              expectedStatus: run.status,
+              events,
+            });
+            return result.committed;
+          }),
+        )
+        .pipe(
+          Effect.mapError(
+            (cause) => new ProjectionStore.ProjectionStoreReadError({ threadId, cause }),
+          ),
+        );
 
     // These callbacks outlive startup while a run drains background work. Build
     // them outside start's scope so they cannot retain its full thread history.
@@ -118,6 +204,7 @@ export const layer: Layer.Layer<
       readonly attemptId: OrchestrationV2RunAttempt["id"];
       readonly providerThreadId: OrchestrationV2ProviderThread["id"];
       readonly runOrdinal: number;
+      readonly backgroundDelivery?: boolean;
       readonly inheritedBackgroundTurnItems: ReturnType<
         typeof RunExecutionService.selectInheritedBackgroundTurnItems
       >;
@@ -148,7 +235,14 @@ export const layer: Layer.Layer<
             ),
             Effect.catchCause(() => Effect.succeed(input.inheritedBackgroundTurnItems)),
           ),
-        shouldStartProviderTurn: () => isCurrentAttemptInStatus("running"),
+        shouldStartProviderTurn: () =>
+          input.backgroundDelivery
+            ? deferBackgroundRun(input.threadId, input.runId).pipe(
+                Effect.flatMap((deferred) =>
+                  deferred ? Effect.succeed(false) : isCurrentAttemptInStatus("running"),
+                ),
+              )
+            : isCurrentAttemptInStatus("running"),
         shouldFinalizeRun: () =>
           projectionStore.getRuntimeRecoveryProjection(input.threadId).pipe(
             Effect.map((current) => {
@@ -234,6 +328,7 @@ export const layer: Layer.Layer<
         (candidate) => candidate.id === run.providerThreadId,
       );
       const message = projection.messages.find((candidate) => candidate.id === run.userMessageId);
+      if (message?.backgroundDelivery && (yield* deferBackgroundRun(input.threadId, runId))) return;
       const checkpointScope = projection.checkpointScopes.find(
         (candidate) => candidate.id === rootNode?.checkpointScopeId,
       );
@@ -506,6 +601,7 @@ export const layer: Layer.Layer<
         .pipe(Effect.map(selectInheritedBackgroundItems));
       const providerSessionId = providerThread.providerSessionId;
       const runControls = makeRunControls({
+        ...(message.backgroundDelivery ? { backgroundDelivery: true } : {}),
         threadId: projection.thread.id,
         runId: run.id,
         attemptId: attempt.id,
@@ -930,6 +1026,7 @@ export const layer: Layer.Layer<
           payload: runningRootNode,
         },
       ];
+      if (message.backgroundDelivery && (yield* deferBackgroundRun(input.threadId, runId))) return;
       const runningWrite = yield* eventSink.writeIfRunCurrent({
         threadId: projection.thread.id,
         runId: run.id,

@@ -37,7 +37,7 @@ import * as Orchestrator from "./Orchestrator.ts";
 import { projectTurnItemForDetail } from "./WireProjection.ts";
 import * as LegacyV1ThreadImporter from "./legacy/LegacyV1ThreadImporter.ts";
 
-export type ThreadManagementSendMode = "auto" | "queue" | "steer" | "restart";
+export type ThreadManagementSendMode = "auto" | "queue" | "steer" | "restart" | "background";
 
 export interface ThreadManagementProvenance {
   readonly createdBy: OrchestrationV2Actor;
@@ -576,6 +576,7 @@ const make = Effect.gen(function* () {
         attachments: input.attachments,
         ...(input.modelSelection === undefined ? {} : { modelSelection: input.modelSelection }),
         dispatchMode,
+        ...(input.mode === "background" ? { deliveryIntent: "background" } : {}),
         createdBy: input.createdBy,
         creationSource: input.creationSource,
       });

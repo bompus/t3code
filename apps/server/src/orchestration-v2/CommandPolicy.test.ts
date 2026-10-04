@@ -34,6 +34,7 @@ function dispatchProjection(
   const providerThreadId = ProviderThreadId.make("command-policy-provider-thread");
   const providerSessionId = ProviderSessionId.make("command-policy-provider-session");
   return {
+    runtimeRequests: [],
     runs:
       sessionCapabilities === undefined
         ? []
@@ -46,6 +47,66 @@ function dispatchProjection(
         : [{ id: providerSessionId, capabilities: sessionCapabilities }],
   } as unknown as OrchestrationV2ThreadProjection;
 }
+
+it("background delivery holds human requests and never chooses interrupt-restart", () => {
+  for (const kind of [
+    "user_input",
+    "command",
+    "file-read",
+    "file-change",
+    "mcp-elicitation",
+    "permission",
+  ] as const) {
+    for (const active of [false, true]) {
+      const projection = dispatchProjection(active ? baseCapabilities : undefined);
+      const blocked = {
+        ...projection,
+        runtimeRequests: [{ kind, status: "pending" }],
+      } as unknown as OrchestrationV2ThreadProjection;
+      assert.deepEqual(
+        CommandPolicy.resolveMessageDispatchIntent(
+          blocked,
+          { type: "start_immediately" },
+          "background",
+        ),
+        { type: "queue_after_active" },
+      );
+    }
+  }
+  const restartOnly = capabilities((current) => ({
+    ...current,
+    turns: {
+      ...current.turns,
+      supportsActiveSteering: false,
+      supportsQueuedMessages: false,
+      supportsSteeringByInterruptRestart: true,
+    },
+  }));
+  assert.deepEqual(
+    CommandPolicy.resolveMessageDispatchIntent(
+      dispatchProjection(restartOnly),
+      { type: "start_immediately" },
+      "background",
+    ),
+    { type: "queue_after_active" },
+  );
+  assert.deepEqual(
+    CommandPolicy.resolveMessageDispatchIntent(
+      dispatchProjection(baseCapabilities),
+      { type: "start_immediately" },
+      "background",
+    ),
+    { type: "steer_active", targetRunId: activeRunId },
+  );
+  assert.deepEqual(
+    CommandPolicy.resolveMessageDispatchIntent(
+      dispatchProjection(),
+      { type: "queue_after_active" },
+      "background",
+    ),
+    { type: "start_immediately" },
+  );
+});
 
 it("resolves automatic message delivery from authoritative provider capabilities", () => {
   assert.deepEqual(

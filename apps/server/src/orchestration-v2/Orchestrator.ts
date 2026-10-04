@@ -73,7 +73,11 @@ import {
   SHARED_WORKSPACE_RESTORE_MESSAGE,
 } from "./CheckpointRestoreSafety.ts";
 import { CheckpointServiceV2 } from "./CheckpointService.ts";
-import { CommandPolicyV2, resolveMessageDispatchIntent } from "./CommandPolicy.ts";
+import {
+  CommandPolicyV2,
+  hasPendingHumanRequest,
+  resolveMessageDispatchIntent,
+} from "./CommandPolicy.ts";
 import { CommandReceiptStoreV2 } from "./CommandReceiptStore.ts";
 import { ContextHandoffServiceV2 } from "./ContextHandoffService.ts";
 import { notificationTurnItem } from "./Notification.ts";
@@ -1283,6 +1287,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       const queuedMessage = projection.messages.find(
         (candidate) => candidate.id === queuedRun.userMessageId,
       );
+      if (queuedMessage?.backgroundDelivery && hasPendingHumanRequest(projection.runtimeRequests))
+        return;
       const legacyQueuedTurnItem = projection.turnItems.find(
         (
           candidate,
@@ -1804,7 +1810,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             },
           })),
           {
-            id: `effect:${commandId}:provider-turn.start:${queuedRun.id}`,
+            id: `effect:${commandId}:provider-turn.start:${queuedRun.id}${queuedRun.backgroundDeferrals === undefined ? "" : `:background-${queuedRun.backgroundDeferrals}`}`,
             commandId,
             threadId,
             request: { type: "provider-turn.start", runId: queuedRun.id },
@@ -3751,6 +3757,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           const message: OrchestrationV2ConversationMessage = {
             createdBy: input.createdBy,
             creationSource: input.creationSource,
+            ...(input.command.type === "message.dispatch" &&
+            input.command.deliveryIntent === "background"
+              ? { backgroundDelivery: true as const }
+              : {}),
             ...(input.delegatedCompletion === undefined
               ? {}
               : { delegatedCompletion: input.delegatedCompletion }),
@@ -3828,20 +3838,24 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       const selectionMustApplyNow =
         selectionChanged &&
         (providerInstanceChanged || selectionTransition?.type !== "apply_on_next_turn");
-      const steeringPolicy = yield* enforceCommandPolicy(input.command)(
-        commandPolicy.decideSteeringExecution({
-          commandId: input.command.commandId,
-          threadId: input.command.threadId,
-          providerInstanceId: targetRun.providerInstanceId,
-          capabilities: session.providerSession.capabilities,
-          forceRestart:
-            input.forceRestart ||
-            selectionMustApplyNow ||
-            (selectionChanged &&
-              turnCapabilities.supportsInterrupt &&
-              turnCapabilities.supportsSteeringByInterruptRestart),
-        }),
-      );
+      const backgroundDelivery =
+        input.command.type === "message.dispatch" && input.command.deliveryIntent === "background";
+      const steeringPolicy = backgroundDelivery
+        ? "active_steering"
+        : yield* enforceCommandPolicy(input.command)(
+            commandPolicy.decideSteeringExecution({
+              commandId: input.command.commandId,
+              threadId: input.command.threadId,
+              providerInstanceId: targetRun.providerInstanceId,
+              capabilities: session.providerSession.capabilities,
+              forceRestart:
+                input.forceRestart ||
+                selectionMustApplyNow ||
+                (selectionChanged &&
+                  turnCapabilities.supportsInterrupt &&
+                  turnCapabilities.supportsSteeringByInterruptRestart),
+            }),
+          );
 
       if (steeringPolicy === "active_steering") {
         // The steer's selection becomes the saved next-turn choice, even when it
@@ -4494,6 +4508,18 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         command.dispatchMode,
         command.deliveryIntent,
       );
+      if (command.deliveryIntent === "background" && dispatchMode.type === "steer_active") {
+        const targetRunId = dispatchMode.targetRunId;
+        const target = projection.runs.find((row) => row.id === targetRunId);
+        if (
+          target?.status !== "running" ||
+          !modelSelectionsEqual(target.modelSelection, modelSelection) ||
+          !projection.providerTurns.some(
+            (turn) => turn.runAttemptId === target.activeAttemptId && turn.status === "running",
+          )
+        )
+          dispatchMode = { type: "queue_after_active" };
+      }
       if (dispatchMode.type === "steer_active") {
         const targetRunId = dispatchMode.targetRunId;
         const target = projection.runs.find((run) => run.id === targetRunId);
@@ -4693,7 +4719,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       const activeRun = projection.runs.find(isBlockingRun);
       const pendingMergeBackTransfers = pendingMergeBackTransfersForThread(projection);
       const shouldQueue =
-        activeRun !== undefined &&
+        (activeRun !== undefined ||
+          (command.deliveryIntent === "background" &&
+            hasPendingHumanRequest(projection.runtimeRequests))) &&
         (dispatchMode.type === "defer_start" ||
           dispatchMode.type === "start_immediately" ||
           dispatchMode.type === "queue_after_active");
@@ -4708,20 +4736,20 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         const queueProviderThread =
           activeProviderThread ??
           projection.providerThreads.find(
-            (candidate) => candidate.id === activeRun.providerThreadId,
+            (candidate) => candidate.id === activeRun?.providerThreadId,
           );
-        if (queueProviderThread === undefined) {
+        if (queueProviderThread === undefined && command.deliveryIntent !== "background") {
           return yield* new OrchestratorDispatchError({
             commandId: command.commandId,
             commandType: command.type,
-            cause: `Active run ${activeRun.id} has no provider thread for queued dispatch.`,
+            cause: `Thread ${command.threadId} has no provider thread for queued dispatch.`,
           });
         }
         const now = yield* DateTime.now;
         const ordinal = nextRunOrdinal(projection);
         const runId = idAllocator.derive.run({ threadId: command.threadId, ordinal });
         const targetProviderThread =
-          modelSelection.instanceId === queueProviderThread.providerInstanceId
+          modelSelection.instanceId === queueProviderThread?.providerInstanceId
             ? queueProviderThread
             : rootProviderThreadsForProvider(projection, modelSelection.instanceId)[0];
         const queuedAdapter = yield* providerAdapters
@@ -4737,14 +4765,15 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         const queuedCapabilities =
           selectedProviderSession?.capabilities ??
           (yield* queuedAdapter.getCapabilities().pipe(mapDispatchError(command)));
-        yield* enforceCommandPolicy(command)(
-          commandPolicy.ensureQueuedMessages({
-            commandId: command.commandId,
-            threadId: command.threadId,
-            providerInstanceId: modelSelection.instanceId,
-            capabilities: queuedCapabilities,
-          }),
-        );
+        if (command.deliveryIntent !== "background")
+          yield* enforceCommandPolicy(command)(
+            commandPolicy.ensureQueuedMessages({
+              commandId: command.commandId,
+              threadId: command.threadId,
+              providerInstanceId: modelSelection.instanceId,
+              capabilities: queuedCapabilities,
+            }),
+          );
         const queuedProviderThread: OrchestrationV2ProviderThread = targetProviderThread ?? {
           id: idAllocator.derive.providerThread({
             driver: queuedAdapter.driver,
@@ -4768,7 +4797,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         const attemptId = idAllocator.derive.runAttempt({ runId, attemptOrdinal: 1 });
         const rootNodeId = idAllocator.derive.rootNode({ runId });
         const checkpointScope =
-          activeRun.status === "preparing"
+          activeRun?.status === "preparing"
             ? null
             : yield* runtimePolicy.resolve({ thread: projection.thread, modelSelection }).pipe(
                 Effect.flatMap((resolvedRuntimePolicy) =>
@@ -4860,6 +4889,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         const message: OrchestrationV2ConversationMessage = {
           createdBy: command.createdBy,
           creationSource: command.creationSource,
+          ...(command.deliveryIntent === "background" ? { backgroundDelivery: true as const } : {}),
           ...(command.scheduledTaskId === undefined
             ? {}
             : { scheduledTaskId: command.scheduledTaskId }),
@@ -5203,6 +5233,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         const message: OrchestrationV2ConversationMessage = {
           createdBy: command.createdBy,
           creationSource: command.creationSource,
+          ...(command.deliveryIntent === "background" ? { backgroundDelivery: true as const } : {}),
           ...(command.scheduledTaskId === undefined
             ? {}
             : { scheduledTaskId: command.scheduledTaskId }),
@@ -5897,6 +5928,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       const message: OrchestrationV2ConversationMessage = {
         createdBy: command.createdBy,
         creationSource: command.creationSource,
+        ...(command.deliveryIntent === "background" ? { backgroundDelivery: true as const } : {}),
         ...(command.scheduledTaskId === undefined
           ? {}
           : { scheduledTaskId: command.scheduledTaskId }),
@@ -9934,6 +9966,29 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             stored.event.payload.status === "rolled_back"),
       ),
       Stream.runForEach(handleTerminalRun),
+      Effect.forkDetach,
+    );
+
+  yield* eventSink
+    .stream({ afterSequence: terminalEventsAfterSequence, eventType: "runtime-request.updated" })
+    .pipe(
+      Stream.filter(
+        (stored) =>
+          stored.event.type === "runtime-request.updated" &&
+          stored.event.payload.status !== "pending",
+      ),
+      Stream.runForEach((stored) =>
+        threadDispatch
+          .withLock(stored.event.threadId, startNextQueuedRun(stored.event.threadId))
+          .pipe(
+            Effect.catchCause((cause) =>
+              Effect.logWarning("Failed to resume background delivery after a request", {
+                threadId: stored.event.threadId,
+                cause,
+              }),
+            ),
+          ),
+      ),
       Effect.forkDetach,
     );
 

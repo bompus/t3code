@@ -14,6 +14,7 @@ import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 
 import * as ProjectionStore from "./ProjectionStore.ts";
+import { hasPendingHumanRequest } from "./CommandPolicy.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 
 const yieldToRuntime = Effect.yieldNow.pipe(
@@ -34,6 +35,7 @@ export class ProviderTurnControlError extends Schema.TaggedError<ProviderTurnCon
     operation: Schema.Literals(["interrupt", "restart", "steer"]),
     providerTurnId: ProviderTurnId,
     turnCompleted: Schema.optional(Schema.Boolean),
+    backgroundDeferred: Schema.optional(Schema.Literal(true)),
     cause: Schema.optional(Schema.Defect()),
   },
 ) {}
@@ -162,6 +164,7 @@ export const layer: Layer.Layer<
             threadId: input.threadId,
             operation: input.operation,
             providerTurnId: input.providerTurnId,
+            ...(context.message?.backgroundDelivery ? { backgroundDeferred: true as const } : {}),
             cause: `Provider session ${input.providerSessionId} is not active.`,
           });
         }
@@ -266,6 +269,14 @@ export const layer: Layer.Layer<
       steer: (input) =>
         Effect.gen(function* () {
           const context = yield* projections.getProviderControlContext(input.threadId, input);
+          // A committed fallback moved this message to a queued run. An outbox retry
+          // must not also send it into the original provider turn.
+          if (
+            context.message?.backgroundDelivery &&
+            context.run !== undefined &&
+            context.message.runId !== context.run.id
+          )
+            return;
           const ownership = context.message?.delegatedCompletion;
           if (ownership !== undefined) {
             const projection = yield* projections.getThreadRecords(input.threadId, ["runs"], {
@@ -292,6 +303,21 @@ export const layer: Layer.Layer<
               providerTurnId: input.providerTurnId,
               cause: "The persisted steering message or target run is missing.",
             });
+          }
+          if (message.backgroundDelivery) {
+            const requests = yield* projections.getThreadRecords(input.threadId, [
+              "runtimeRequests",
+            ]);
+            if (
+              hasPendingHumanRequest(requests.runtimeRequests) ||
+              !loaded.session.value.providerSession.capabilities.turns.supportsActiveSteering
+            )
+              return yield* new ProviderTurnControlError({
+                threadId: input.threadId,
+                operation: "steer",
+                providerTurnId: input.providerTurnId,
+                backgroundDeferred: true,
+              });
           }
           yield* loaded.session.value
             .steerTurn({

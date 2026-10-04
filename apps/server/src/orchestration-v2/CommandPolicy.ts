@@ -4,6 +4,7 @@ import {
   type OrchestrationV2Command,
   OrchestrationV2ProviderCapabilities,
   type OrchestrationV2Run,
+  type OrchestrationV2RuntimeRequest,
   OrchestrationV2ThreadProjection,
   ProviderInstanceId,
   ProviderTurnId,
@@ -116,11 +117,22 @@ type MessageDispatchMode = Extract<
   { readonly type: "message.dispatch" }
 >["dispatchMode"];
 
+export function hasPendingHumanRequest(
+  requests: ReadonlyArray<OrchestrationV2RuntimeRequest>,
+): boolean {
+  return requests.some(
+    (request) =>
+      request.status === "pending" &&
+      request.kind !== "dynamic_tool_call" &&
+      request.kind !== "auth_refresh",
+  );
+}
+
 /** Resolve client intent from the state serialized by the thread dispatch lock. */
 export function resolveMessageDispatchIntent(
   projection: OrchestrationV2ThreadProjection,
   requestedMode: MessageDispatchMode,
-  deliveryIntent?: "auto" | "steer" | "restart",
+  deliveryIntent?: "auto" | "steer" | "restart" | "background",
 ): MessageDispatchMode {
   if (deliveryIntent === undefined) return requestedMode;
 
@@ -131,7 +143,12 @@ export function resolveMessageDispatchIntent(
       run.status === "running" ||
       run.status === "waiting",
   );
+  if (deliveryIntent === "background" && hasPendingHumanRequest(projection.runtimeRequests)) {
+    return { type: "queue_after_active" };
+  }
   if (activeRun === undefined) return { type: "start_immediately" };
+  if (deliveryIntent === "background" && requestedMode.type === "queue_after_active")
+    return requestedMode;
   if (deliveryIntent === "steer") {
     return { type: "steer_active", targetRunId: activeRun.id };
   }
@@ -158,7 +175,10 @@ export function resolveMessageDispatchIntent(
   if (capabilities?.supportsQueuedMessages === true) {
     return { type: "queue_after_active" };
   }
-  if (capabilities?.supportsSteeringByInterruptRestart === true) {
+  if (
+    deliveryIntent !== "background" &&
+    capabilities?.supportsSteeringByInterruptRestart === true
+  ) {
     return { type: "restart_active", targetRunId: activeRun.id };
   }
   return { type: "queue_after_active" };

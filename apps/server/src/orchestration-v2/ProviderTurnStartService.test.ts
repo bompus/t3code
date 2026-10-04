@@ -11,6 +11,7 @@ import {
   ProviderSetupError,
   RunAttemptId,
   RunId,
+  RuntimeRequestId,
   ThreadId,
   ProjectId,
   type OrchestrationV2ThreadProjection,
@@ -37,6 +38,7 @@ import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 import * as ProviderTurnStart from "./ProviderTurnStartService.ts";
 import * as RunExecutionService from "./RunExecutionService.ts";
 import * as RuntimePolicy from "./RuntimePolicy.ts";
+import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
 
 const isDomainEvent = Schema.is(OrchestrationV2DomainEvent);
 
@@ -95,6 +97,7 @@ it("does not commit running state when inherited background routing cannot be re
         Layer.mock(ContextHandoffService.ContextHandoffServiceV2)({}),
         Layer.mock(EventSink.EventSinkV2)({ writeIfRunCurrent }),
         IdAllocator.layer,
+        ThreadCommandExecutor.layer,
         Layer.succeed(FileSystem.FileSystem, { exists: () => Effect.succeed(false) } as never),
         Layer.mock(GitWorkflow.GitWorkflowService)({ pruneWorktrees, createWorktree }),
         Layer.mock(ProjectService.ProjectService)({
@@ -171,6 +174,7 @@ function makeLocalCommandHarness(input: {
   readonly writeFailure?: unknown;
   /** Loads the thread and starts the run, then fails every later state read. */
   readonly failReadsAfterRunning?: boolean;
+  readonly pendingBackgroundQuestion?: "before-open" | "during-open";
 }) {
   const now = DateTime.makeUnsafe("2026-09-04T12:00:00Z");
   const threadId = ThreadId.make("thread-native-account-command");
@@ -225,6 +229,7 @@ function makeLocalCommandHarness(input: {
     nodeId: rootNodeId,
     role: "user",
     text: input.text,
+    ...(input.pendingBackgroundQuestion ? { backgroundDelivery: true as const } : {}),
     attachments: [],
     streaming: false,
     createdBy: "user",
@@ -366,6 +371,25 @@ function makeLocalCommandHarness(input: {
       ),
     };
   };
+  const ask = () => {
+    projection = {
+      ...projection,
+      runtimeRequests: [
+        {
+          id: RuntimeRequestId.make("background-start-question"),
+          nodeId: NodeId.make("background-question-node"),
+          providerTurnId: null,
+          nativeRequestRef: null,
+          kind: "user_input",
+          status: "pending",
+          responseCapability: { type: "message" },
+          createdAt: now,
+          resolvedAt: null,
+        },
+      ],
+    };
+  };
+  if (input.pendingBackgroundQuestion === "before-open") ask();
   const ensureThread = vi.fn(() =>
     Effect.sync(() => {
       if (input.interruptRunBeforeOpenFailure === true) interruptRun();
@@ -394,44 +418,53 @@ function makeLocalCommandHarness(input: {
     ensureThread: () => Effect.succeed(providerThread),
   };
   const open = vi.fn(() =>
-    input.interruptOpen === true
-      ? Effect.interrupt
-      : "historyReadFailureAfterFallback" in input
-        ? Effect.succeed(resumeFallbackSession as never)
-        : "ensureThreadFailure" in input
-          ? Effect.succeed({ driver: providerThread.driver, ensureThread } as never)
-          : "openFailure" in input
-            ? Effect.sync(() => {
-                if (input.interruptRunBeforeOpenFailure === true) interruptRun();
-              }).pipe(
-                Effect.andThen(
-                  Effect.fail(
-                    new ProviderSessionManager.ProviderSessionOpenError({
-                      instanceId: newInstanceId,
-                      providerSessionId,
-                      cause: input.openFailure,
-                    }),
+    input.pendingBackgroundQuestion === "during-open"
+      ? Effect.succeed({
+          driver: providerThread.driver,
+          ensureThread: () =>
+            Effect.sync(() => {
+              ask();
+              return providerThread;
+            }),
+        } as never)
+      : input.interruptOpen === true
+        ? Effect.interrupt
+        : "historyReadFailureAfterFallback" in input
+          ? Effect.succeed(resumeFallbackSession as never)
+          : "ensureThreadFailure" in input
+            ? Effect.succeed({ driver: providerThread.driver, ensureThread } as never)
+            : "openFailure" in input
+              ? Effect.sync(() => {
+                  if (input.interruptRunBeforeOpenFailure === true) interruptRun();
+                }).pipe(
+                  Effect.andThen(
+                    Effect.fail(
+                      new ProviderSessionManager.ProviderSessionOpenError({
+                        instanceId: newInstanceId,
+                        providerSessionId,
+                        cause: input.openFailure,
+                      }),
+                    ),
                   ),
-                ),
-              )
-            : input.failReadsAfterRunning === true
-              ? Effect.succeed({
-                  driver: providerThread.driver,
-                  providerSession: {
-                    id: providerSessionId,
+                )
+              : input.failReadsAfterRunning === true
+                ? Effect.succeed({
                     driver: providerThread.driver,
-                    providerInstanceId: newInstanceId,
-                    status: "ready",
-                    cwd: "/tmp/native-account-command",
-                    model: null,
-                    capabilities: CodexProviderCapabilitiesV2,
-                    createdAt: now,
-                    updatedAt: now,
-                    lastError: null,
-                  },
-                  ensureThread: () => Effect.succeed(providerThread),
-                } as never)
-              : Effect.die("A local command must not open a native session."),
+                    providerSession: {
+                      id: providerSessionId,
+                      driver: providerThread.driver,
+                      providerInstanceId: newInstanceId,
+                      status: "ready",
+                      cwd: "/tmp/native-account-command",
+                      model: null,
+                      capabilities: CodexProviderCapabilitiesV2,
+                      createdAt: now,
+                      updatedAt: now,
+                      lastError: null,
+                    },
+                    ensureThread: () => Effect.succeed(providerThread),
+                  } as never)
+                : Effect.die("A local command must not open a native session."),
   );
   const startRootRun = vi.fn<
     (input: RunExecutionService.RunExecutionServiceV2StartRootRunInput) => Effect.Effect<void>
@@ -491,10 +524,12 @@ function makeLocalCommandHarness(input: {
         }),
         Layer.mock(EventSink.EventSinkV2)({ writeIfRunCurrent }),
         IdAllocator.layer,
+        ThreadCommandExecutor.layer,
         FileSystem.layerNoop({}),
         Layer.mock(GitWorkflow.GitWorkflowService)({}),
         Layer.mock(ProjectService.ProjectService)({}),
         Layer.mock(ProjectionStore.ProjectionStoreV2)({
+          getThreadRecords: () => Effect.succeed(projection),
           getTurnStartContext: () =>
             Effect.succeed({
               ...projection,
@@ -853,5 +888,34 @@ for (const previousMessages of [[], ["/compact", " /COMPACT "]]) {
           },
         ]);
       }),
+  );
+}
+
+for (const when of ["before-open", "during-open"] as const) {
+  effectIt.effect(`requeues background mail when a question appears ${when}`, () =>
+    Effect.gen(function* () {
+      const harness = makeLocalCommandHarness({
+        text: "Read the inbox.",
+        pendingBackgroundQuestion: when,
+      });
+      const initial = harness.projection();
+      yield* harness.start;
+      const after = harness.projection();
+      expect(after.runs.at(-1)).toMatchObject({
+        id: initial.runs.at(-1)!.id,
+        status: "queued",
+        backgroundDeferrals: 1,
+        startedAt: null,
+      });
+      expect(after.messages[0]).toMatchObject({
+        id: initial.messages[0]!.id,
+        backgroundDelivery: true,
+      });
+      expect(after.runtimeRequests[0]?.status).toBe("pending");
+      expect(after.nodes[0]?.status).toBe("pending");
+      expect(after.attempts[0]?.status).toBe("pending");
+      expect(harness.startRootRun).not.toHaveBeenCalled();
+      expect(harness.open).toHaveBeenCalledTimes(when === "before-open" ? 0 : 1);
+    }),
   );
 }

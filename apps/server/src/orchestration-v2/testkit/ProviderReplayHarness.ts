@@ -364,6 +364,7 @@ export function makeOrchestratorV2ReplayLayerWithRegistry<Error>(
   const providerTurnStartServiceProvided = ProviderTurnStartService.layer.pipe(
     Layer.provide(
       Layer.mergeAll(
+        ThreadCommandExecutor.layer,
         contextHandoffServiceProvided,
         eventSinkProvided,
         IdAllocator.layer,

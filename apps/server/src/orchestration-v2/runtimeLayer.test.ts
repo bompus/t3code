@@ -57,6 +57,12 @@ import * as LegacyV1ThreadImporter from "./legacy/LegacyV1ThreadImporter.ts";
 import * as Orchestrator from "./Orchestrator.ts";
 import { ROLLBACK_FAILED_MESSAGE } from "./CheckpointRollbackService.ts";
 import * as EffectWorker from "./EffectWorker.ts";
+import * as ThreadTitleRegenerationService from "./ThreadTitleRegenerationService.ts";
+import * as RuntimeRequestService from "./RuntimeRequestService.ts";
+import * as CheckpointRollbackService from "./CheckpointRollbackService.ts";
+import * as RunFinalizationService from "./RunFinalizationService.ts";
+import * as ProviderTurnStartService from "./ProviderTurnStartService.ts";
+import * as ProviderTurnControlService from "./ProviderTurnControlService.ts";
 import * as EffectOutbox from "./EffectOutbox.ts";
 import * as EventSink from "./EventSink.ts";
 import * as ProviderRuntimeRecoveryService from "./ProviderRuntimeRecoveryService.ts";
@@ -426,6 +432,439 @@ const SharedApplicationDataPlaneTestLayer = Layer.mergeAll(
   Layer.provide(GitWorkflowTestLayer),
   Layer.provide(PlatformTestLayer),
 );
+
+const seedBackgroundQuestion = Effect.fn("test.seedBackgroundQuestion")(function* (
+  name: string,
+  threadId: ThreadId,
+) {
+  const sink = yield* EventSink.EventSinkV2;
+  const now = yield* DateTime.now;
+  const requestId = RuntimeRequestId.make(`${name}-question`);
+  const nodeId = NodeId.make(`${name}-question-node`);
+  yield* sink.write({
+    events: [
+      {
+        id: EventId.make(`${name}-node-event`),
+        type: "node.updated",
+        threadId,
+        nodeId,
+        occurredAt: now,
+        payload: {
+          id: nodeId,
+          threadId,
+          runId: null,
+          parentNodeId: null,
+          rootNodeId: nodeId,
+          kind: "user_input_request",
+          status: "waiting",
+          countsForRun: false,
+          providerThreadId: null,
+          providerTurnId: null,
+          nativeItemRef: null,
+          runtimeRequestId: requestId,
+          checkpointScopeId: null,
+          startedAt: now,
+          completedAt: null,
+        },
+      },
+      {
+        id: EventId.make(`${name}-request-event`),
+        type: "runtime-request.updated",
+        threadId,
+        nodeId,
+        occurredAt: now,
+        payload: {
+          id: requestId,
+          nodeId,
+          providerTurnId: null,
+          nativeRequestRef: null,
+          kind: "user_input",
+          status: "pending",
+          responseCapability: { type: "message" },
+          createdAt: now,
+          resolvedAt: null,
+        },
+      },
+      {
+        id: EventId.make(`${name}-item-event`),
+        type: "turn-item.updated",
+        threadId,
+        nodeId,
+        occurredAt: now,
+        payload: {
+          id: TurnItemId.make(`${name}-item`),
+          type: "user_input_request",
+          threadId,
+          runId: null,
+          nodeId,
+          providerThreadId: null,
+          providerTurnId: null,
+          nativeItemRef: null,
+          parentItemId: null,
+          ordinal: 0,
+          status: "waiting",
+          title: null,
+          startedAt: now,
+          completedAt: null,
+          updatedAt: now,
+          requestId,
+          responseMode: "message",
+          questions: [{ id: "answer", header: "Answer", question: "Continue?", options: [] }],
+        },
+      },
+    ],
+  });
+  return requestId;
+});
+
+it.layer(TestLayer)("background message delivery", (it) => {
+  const create = (threadId: ThreadId) =>
+    Effect.flatMap(Orchestrator.OrchestratorV2, (orchestrator) =>
+      orchestrator.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make(`${threadId}-create`),
+        createdBy: "user",
+        creationSource: "web",
+        threadId,
+        projectId: ProjectId.make(`${threadId}-project`),
+        title: "Background delivery",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: process.cwd(),
+      }),
+    );
+  const mail = (threadId: ThreadId) =>
+    Effect.flatMap(ThreadManagementService.ThreadManagementService, (threads) =>
+      threads.sendToThread({
+        projectId: ProjectId.make(`${threadId}-project`),
+        threadId,
+        commandId: CommandId.make(`${threadId}-mail`),
+        messageId: MessageId.make(`${threadId}-mail`),
+        text: "Read the inbox.",
+        attachments: [],
+        createdBy: "agent",
+        creationSource: "mcp",
+        mode: "background",
+      }),
+    );
+
+  it.effect("keeps mail queued on an idle async question and starts its answer first", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
+      const threadId = ThreadId.make("background-answer-precedence");
+      yield* create(threadId);
+      const requestId = yield* seedBackgroundQuestion("background-answer-precedence", threadId);
+      const delivered = yield* mail(threadId);
+      assert.equal(delivered.run.status, "queued");
+      const pending = yield* orchestrator.getThreadProjection(threadId);
+      assert.equal(pending.runtimeRequests[0]?.status, "pending");
+      assert.isTrue(pending.messages[0]?.backgroundDelivery);
+      assert.deepEqual(yield* outbox.listByCommandId(CommandId.make(`${threadId}-mail`)), []);
+      const answered = yield* orchestrator.dispatch({
+        type: "runtime-request.respond",
+        commandId: CommandId.make(`${threadId}-answer`),
+        threadId,
+        requestId,
+        answers: { answer: "Yes" },
+      });
+      const after = yield* orchestrator.getThreadProjection(threadId);
+      assert.equal(after.runs.find((run) => run.id === delivered.run.id)?.status, "queued");
+      assert.equal(
+        after.runs.find((run) => run.userMessageId === MessageId.make(`async-answer:${requestId}`))
+          ?.status,
+        "starting",
+      );
+      assert.equal(after.runtimeRequests[0]?.status, "resolved");
+      assert.deepEqual(
+        answered.storedEvents.flatMap((event) =>
+          event.event.type === "run.created" ? [event.event.payload.status] : [],
+        ),
+        ["starting"],
+      );
+    }),
+  );
+
+  it.effect.each(["capability-change", "session-missing"] as const)(
+    "queues a deferred background steer through the real worker and orchestrator: %s",
+    (condition) =>
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const sink = yield* EventSink.EventSinkV2;
+        const outbox = yield* EffectOutbox.EffectOutboxV2;
+        const sessions = yield* ProviderSessionManager.ProviderSessionManagerV2;
+        const threadId = ThreadId.make(`background-recovery-${condition}`);
+        yield* create(threadId);
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make(`${threadId}-first`),
+          threadId,
+          messageId: MessageId.make(`${threadId}-first`),
+          text: "User work",
+          attachments: [],
+          dispatchMode: { type: "start_immediately" },
+          createdBy: "user",
+          creationSource: "web",
+        });
+        const initial = yield* orchestrator.getThreadProjection(threadId);
+        const run = initial.runs[0]!;
+        const providerThread = initial.providerThreads[0]!;
+        const now = yield* DateTime.now;
+        const providerSession = {
+          id: providerThread.providerSessionId!,
+          driver,
+          providerInstanceId: modelSelection.instanceId,
+          status: "running" as const,
+          cwd: process.cwd(),
+          model: modelSelection.model,
+          capabilities: CodexProviderCapabilitiesV2,
+          createdAt: now,
+          updatedAt: now,
+          lastError: null,
+        };
+        const providerTurn = {
+          id: ProviderTurnId.make(`${threadId}-turn`),
+          providerThreadId: providerThread.id,
+          nodeId: run.rootNodeId!,
+          runAttemptId: run.activeAttemptId,
+          nativeTurnRef: null,
+          ordinal: 1,
+          status: "running" as const,
+          startedAt: now,
+          completedAt: null,
+        };
+        yield* sink.write({
+          events: [
+            {
+              id: EventId.make(`${threadId}-running`),
+              threadId,
+              runId: run.id,
+              occurredAt: now,
+              type: "run.updated",
+              payload: { ...run, status: "running", startedAt: now },
+            },
+            {
+              id: EventId.make(`${threadId}-session`),
+              threadId,
+              occurredAt: now,
+              type: "provider-session.attached",
+              payload: providerSession,
+            },
+            {
+              id: EventId.make(`${threadId}-turn`),
+              threadId,
+              runId: run.id,
+              occurredAt: now,
+              type: "provider-turn.updated",
+              payload: providerTurn,
+            },
+          ],
+        });
+        const runtime: ProviderAdapterV2SessionRuntime = {
+          providerSession,
+          instanceId: modelSelection.instanceId,
+          driver,
+          providerSessionId: providerSession.id,
+          events: Stream.empty,
+          steerTurn: () => Effect.die("deferred background must not reach native steering"),
+          ensureThread: () => Effect.die("unused"),
+          resumeThread: () => Effect.die("unused"),
+          startTurn: () => Effect.die("background must not restart"),
+          interruptTurn: () => Effect.die("background must not interrupt"),
+          respondToRuntimeRequest: () => Effect.die("background must not answer"),
+          readThreadSnapshot: () => Effect.die("unused"),
+          rollbackThread: () => Effect.die("unused"),
+          forkThread: () => Effect.die("unused"),
+        };
+        const spy = vi.spyOn(sessions, "get").mockReturnValue(Effect.succeed(Option.some(runtime)));
+        yield* Effect.addFinalizer(() => Effect.sync(() => spy.mockRestore()));
+        const delivered = yield* mail(threadId);
+        const admitted = yield* outbox.listByCommandId(CommandId.make(`${threadId}-mail`));
+        assert.lengthOf(admitted, 1);
+        assert.equal(admitted[0]?.request.type, "provider-turn.steer");
+        spy.mockReturnValue(
+          Effect.succeed(
+            condition === "session-missing"
+              ? Option.none()
+              : Option.some({
+                  ...runtime,
+                  providerSession: {
+                    ...providerSession,
+                    capabilities: {
+                      ...CodexProviderCapabilitiesV2,
+                      turns: {
+                        ...CodexProviderCapabilitiesV2.turns,
+                        supportsActiveSteering: false,
+                      },
+                    },
+                  },
+                }),
+          ),
+        );
+        const executorLayer = EffectWorker.executorLayer.pipe(
+          Layer.provide(
+            Layer.mergeAll(
+              ProviderTurnControlService.layer,
+              Layer.mock(ProviderTurnStartService.ProviderTurnStartServiceV2)({}),
+              Layer.mock(RunFinalizationService.RunFinalizationService)({}),
+              Layer.mock(CheckpointRollbackService.CheckpointRollbackServiceV2)({}),
+              Layer.mock(RuntimeRequestService.RuntimeRequestServiceV2)({}),
+              Layer.mock(ThreadTitleRegenerationService.ThreadTitleRegenerationService)({}),
+            ),
+          ),
+        );
+        yield* Effect.gen(function* () {
+          const executor = yield* EffectWorker.OrchestrationEffectExecutorV2;
+          yield* executor.execute(admitted[0]!);
+          yield* executor.execute(admitted[0]!);
+          // Replay after the fallback committed but before the original effect completed.
+          spy.mockReturnValue(Effect.succeed(Option.some(runtime)));
+          yield* executor.execute(admitted[0]!);
+        }).pipe(Effect.provide(executorLayer.pipe(Layer.provide(ServerSettings.layerTest()))));
+        const after = yield* orchestrator.getThreadProjection(threadId);
+        assert.equal(after.runs.find((row) => row.id === run.id)?.status, "running");
+        const queued = after.runs.filter((row) => row.status === "queued");
+        assert.lengthOf(queued, 1);
+        assert.equal(queued[0]?.userMessageId, delivered.message.id);
+        assert.lengthOf(
+          after.messages.filter((row) => row.id === delivered.message.id),
+          1,
+        );
+        assert.isTrue(
+          after.messages.find((row) => row.id === delivered.message.id)?.backgroundDelivery,
+        );
+        assert.deepEqual(
+          yield* outbox.listByCommandId(
+            CommandId.make(`command:steer-follow-up:${admitted[0]!.id}`),
+          ),
+          [],
+        );
+      }),
+  );
+
+  it.effect("gives repeated deferred promotions distinct durable start effects", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const sink = yield* EventSink.EventSinkV2;
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
+      const threadId = ThreadId.make("background-repeated-deferral");
+      yield* create(threadId);
+      let requestId = yield* seedBackgroundQuestion("background-deferral-initial", threadId);
+      const delivered = yield* mail(threadId);
+      const promoted = yield* Queue.unbounded<void>();
+      const afterSequence = yield* orchestrator.getThreadEventSequence(threadId);
+      yield* sink.stream({ threadId, afterSequence }).pipe(
+        Stream.runForEach((stored) =>
+          stored.event.type === "run.updated" &&
+          stored.event.payload.id === delivered.run.id &&
+          stored.event.payload.status === "starting"
+            ? Queue.offer(promoted, undefined)
+            : Effect.void,
+        ),
+        Effect.forkScoped,
+      );
+      for (let generation = 0; generation < 3; generation += 1) {
+        yield* orchestrator.dispatch({
+          type: "runtime-request.respond",
+          commandId: CommandId.make(`${threadId}-clear-${generation}`),
+          threadId,
+          requestId,
+          decision: "cancel",
+        });
+        yield* Queue.take(promoted);
+        const current = yield* orchestrator.getThreadProjection(threadId);
+        const run = current.runs.find((row) => row.id === delivered.run.id)!;
+        const starts = (yield* outbox.listByCommandId(
+          CommandId.make(`command:system:start-queued:${run.id}`),
+        )).filter((effect) => effect.request.type === "provider-turn.start");
+        assert.lengthOf(starts, generation + 1);
+        assert.equal(new Set(starts.map((effect) => effect.id)).size, generation + 1);
+        assert.equal(
+          current.messages.find((message) => message.id === delivered.message.id)?.runId,
+          run.id,
+        );
+        if (generation < 2) {
+          requestId = yield* seedBackgroundQuestion(`background-deferral-${generation}`, threadId);
+          // Model the unstarted state persisted by the separately tested start service.
+          yield* sink.write({
+            events: [
+              {
+                id: EventId.make(`${threadId}-defer-${generation}`),
+                type: "run.updated",
+                threadId,
+                runId: run.id,
+                occurredAt: yield* DateTime.now,
+                payload: {
+                  ...run,
+                  status: "queued",
+                  queuePosition: 1,
+                  backgroundDeferrals: generation + 1,
+                },
+              },
+            ],
+          });
+        }
+      }
+    }),
+  );
+
+  it.effect("requires every pending question to clear before promoting mail", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const sink = yield* EventSink.EventSinkV2;
+      const threadId = ThreadId.make("background-two-questions");
+      yield* create(threadId);
+      const first = yield* seedBackgroundQuestion("background-two-questions-first", threadId);
+      const second = yield* seedBackgroundQuestion("background-two-questions-second", threadId);
+      const delivered = yield* mail(threadId);
+      yield* orchestrator.dispatch({
+        type: "runtime-request.respond",
+        commandId: CommandId.make(`${threadId}-cancel-first`),
+        threadId,
+        requestId: first,
+        decision: "cancel",
+      });
+      yield* orchestrator.dispatch({
+        type: "queue.resume",
+        commandId: CommandId.make(`${threadId}-resume`),
+        threadId,
+      });
+      assert.equal(
+        (yield* orchestrator.getThreadProjection(threadId)).runs.find(
+          (run) => run.id === delivered.run.id,
+        )?.status,
+        "queued",
+      );
+      const promoted = yield* Deferred.make<void>();
+      const afterSequence = yield* orchestrator.getThreadEventSequence(threadId);
+      yield* sink.stream({ threadId, afterSequence }).pipe(
+        Stream.runForEach((stored) =>
+          stored.event.type === "run.updated" &&
+          stored.event.payload.id === delivered.run.id &&
+          stored.event.payload.status === "starting"
+            ? Deferred.succeed(promoted, undefined)
+            : Effect.void,
+        ),
+        Effect.forkScoped,
+      );
+      yield* orchestrator.dispatch({
+        type: "runtime-request.respond",
+        commandId: CommandId.make(`${threadId}-cancel-second`),
+        threadId,
+        requestId: second,
+        decision: "cancel",
+      });
+      yield* Deferred.await(promoted);
+      const after = yield* orchestrator.getThreadProjection(threadId);
+      assert.equal(after.runs.find((run) => run.id === delivered.run.id)?.status, "starting");
+      assert.isTrue(
+        after.messages.find((message) => message.id === delivered.message.id)?.backgroundDelivery,
+      );
+    }),
+  );
+});
 
 it.layer(TestLayer)("OrchestrationV2LayerLive", (it) => {
   it.effect("emits model updates separately from provider switches", () =>

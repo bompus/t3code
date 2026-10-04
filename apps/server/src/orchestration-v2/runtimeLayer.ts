@@ -157,6 +157,7 @@ const providerTurnStartServiceProvided = providerTurnStartServiceLayer.pipe(
       providerAuthServiceProvided,
       runExecutionServiceProvided,
       runtimePolicyProvided,
+      ThreadCommandExecutor.layer,
     ),
   ),
 );

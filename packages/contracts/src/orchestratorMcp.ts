@@ -408,7 +408,7 @@ export type OrchestratorMcpThreadReadResult = typeof OrchestratorMcpThreadReadRe
 export const OrchestratorMcpThreadSendInput = Schema.Struct({
   threadId: ThreadId,
   message: OrchestratorMcpPrompt,
-  mode: Schema.optional(Schema.Literals(["auto", "queue", "steer", "restart"])),
+  mode: Schema.optional(Schema.Literals(["auto", "queue", "steer", "restart", "background"])),
   clientRequestId: Schema.optional(OrchestratorMcpClientRequestId),
 });
 export type OrchestratorMcpThreadSendInput = typeof OrchestratorMcpThreadSendInput.Type;

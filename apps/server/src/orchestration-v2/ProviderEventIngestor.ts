@@ -33,6 +33,7 @@ import * as IdAllocator from "./IdAllocator.ts";
 import { ProviderAdapterV2Event } from "./ProviderAdapter.ts";
 import { makeProviderFailureTurnItem } from "./ProviderFailure.ts";
 import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
+import { hasPendingHumanRequest } from "./CommandPolicy.ts";
 
 export class ProviderEventNormalizeError extends Schema.TaggedError<ProviderEventNormalizeError>()(
   "ProviderEventNormalizeError",
@@ -591,6 +592,11 @@ export const layer: Layer.Layer<
             .pipe(Effect.mapError(mapWriteError));
           return result.storedEvents;
         }).pipe(
+          (operation) =>
+            input.event.type === "runtime_request.updated" &&
+            hasPendingHumanRequest([{ ...input.event.runtimeRequest, status: "pending" }])
+              ? threadCommands.withLock(input.event.threadId ?? input.threadId, operation)
+              : operation,
           Effect.flatMap((storedEvents) =>
             storedEvents.length === 0 || input.event.type !== "subagent.updated"
               ? Effect.succeed(storedEvents)

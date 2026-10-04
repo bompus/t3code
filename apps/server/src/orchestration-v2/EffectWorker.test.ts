@@ -1,6 +1,11 @@
 import { assert, it } from "@effect/vitest";
 import {
   CommandId,
+  MessageId,
+  NodeId,
+  ProviderInstanceId,
+  type OrchestrationV2ServerCommand,
+  type OrchestrationV2ThreadProjection,
   ProviderSessionId,
   ProviderThreadId,
   ProviderTurnId,
@@ -21,6 +26,7 @@ import * as TestClock from "effect/testing/TestClock";
 
 import * as CheckpointRollbackService from "./CheckpointRollbackService.ts";
 import * as EffectOutbox from "./EffectOutbox.ts";
+import type { ProjectionRecordField, ProjectionRecords } from "./ProjectionStore.ts";
 import * as EffectWorker from "./EffectWorker.ts";
 import * as RunFinalizationService from "./RunFinalizationService.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
@@ -81,6 +87,7 @@ function makeExecutorLayer(input: {
   readonly failFirstStart?: Ref.Ref<boolean>;
   readonly threads?: Partial<ThreadManagementService.ThreadManagementService["Service"]>;
   readonly continueAfterRestart?: boolean;
+  readonly steerError?: ProviderTurnControlService.ProviderTurnControlError;
 }) {
   const record = (event: string) => Ref.update(input.events, (events) => [...events, event]);
   const dependencies = Layer.mergeAll(
@@ -88,7 +95,7 @@ function makeExecutorLayer(input: {
       ProviderTurnControlService.ProviderTurnControlServiceV2,
       ProviderTurnControlService.ProviderTurnControlServiceV2.of({
         interrupt: () => Effect.void,
-        steer: () => Effect.void,
+        steer: () => (input.steerError === undefined ? Effect.void : Effect.fail(input.steerError)),
         interruptAndAwaitTerminal: (request) =>
           record(
             request.replacementProviderSessionId === undefined
@@ -799,4 +806,93 @@ it.effect("settles a delegated child once its restart continuation fails for goo
       assert.deepEqual(yield* Ref.get(recovered), [threadId]);
     }).pipe(Effect.provide(layer));
   }),
+);
+
+it.effect(
+  "preserves background delivery and message identity when a late question defers steering",
+  () =>
+    Effect.gen(function* () {
+      const now = yield* DateTime.now;
+      const events = yield* Ref.make<ReadonlyArray<string>>([]);
+      const commands = yield* Ref.make<ReadonlyArray<OrchestrationV2ServerCommand>>([]);
+      const messageId = MessageId.make("message:background-steer");
+      const nodeId = NodeId.make("node:background-steer");
+      const instanceId = ProviderInstanceId.make("codex");
+      const message: OrchestrationV2ThreadProjection["messages"][number] = {
+        id: messageId,
+        threadId,
+        runId,
+        nodeId,
+        role: "user",
+        text: "Routine notification",
+        backgroundDelivery: true,
+        attachments: [],
+        streaming: false,
+        createdBy: "system",
+        creationSource: "mcp",
+        createdAt: now,
+        updatedAt: now,
+      };
+      const run: OrchestrationV2ThreadProjection["runs"][number] = {
+        id: runId,
+        threadId,
+        ordinal: 1,
+        providerInstanceId: instanceId,
+        modelSelection: { instanceId, model: "gpt-5.4" },
+        providerThreadId,
+        userMessageId: messageId,
+        rootNodeId: nodeId,
+        activeAttemptId: attemptId,
+        status: "running",
+        requestedAt: now,
+        startedAt: now,
+        completedAt: null,
+        checkpointId: null,
+        contextHandoffId: null,
+      };
+      const effect: EffectOutbox.OrchestrationEffectV2 = {
+        ...restartEffect(now, { type: "detach" }),
+        id: "effect:background-steer",
+        request: {
+          type: "provider-turn.steer",
+          providerSessionId: oldSessionId,
+          providerThreadId,
+          providerTurnId,
+          messageId,
+        },
+      };
+      const layer = makeExecutorLayer({
+        events,
+        steerError: new ProviderTurnControlService.ProviderTurnControlError({
+          threadId,
+          operation: "steer",
+          providerTurnId,
+          backgroundDeferred: true,
+        }),
+        threads: {
+          getThreadRecords: <K extends ProjectionRecordField>() =>
+            Effect.succeed({ messages: [message], runs: [run] } as unknown as ProjectionRecords<K>),
+          dispatch: (command) =>
+            Ref.update(commands, (previous) => [...previous, command]).pipe(
+              Effect.as({ sequence: 0, storedEvents: [] }),
+            ),
+        },
+      });
+      yield* Effect.gen(function* () {
+        const executor = yield* EffectWorker.OrchestrationEffectExecutorV2;
+        yield* executor.execute(effect);
+        yield* executor.execute(effect);
+      }).pipe(Effect.provide(layer));
+      const delivered = yield* Ref.get(commands);
+      assert.equal(delivered.length, 2);
+      assert.deepEqual(delivered[0], delivered[1]);
+      assert.equal(delivered[0]?.type, "message.dispatch");
+      if (delivered[0]?.type === "message.dispatch") {
+        assert.equal(delivered[0].messageId, messageId);
+        assert.equal(delivered[0].deliveryIntent, "background");
+        assert.deepEqual(delivered[0].dispatchMode, { type: "queue_after_active" });
+        assert.equal(delivered[0].commandId, "command:steer-follow-up:effect:background-steer");
+      }
+      assert.deepEqual(yield* Ref.get(events), []);
+    }),
 );

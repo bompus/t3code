@@ -1093,6 +1093,85 @@ layer("ProviderEventIngestorV2", (it) => {
       ),
   );
 
+  it.effect("commits a human question before the next serialized thread command reads it", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const eventSink = yield* EventSink.EventSinkV2;
+        const projections = yield* ProjectionStore.ProjectionStoreV2;
+        const threadCommands = yield* ThreadCommandExecutor.ThreadCommandExecutor;
+        const idAllocator = yield* IdAllocator.IdAllocatorV2;
+        const now = yield* DateTime.now;
+        const threadEvent = yield* threadCreatedEvent(now);
+        const threadId = threadEvent.threadId;
+        yield* eventSink.write({ events: [threadEvent] });
+        const providerSessionId = yield* idAllocator.allocate.providerSession({
+          providerInstanceId: modelSelection.instanceId,
+          threadId,
+        });
+        const request: OrchestrationV2RuntimeRequest = {
+          id: RuntimeRequestId.make(`${threadId}:serialized-question`),
+          nodeId: NodeId.make(`${threadId}:serialized-question`),
+          providerTurnId: null,
+          nativeRequestRef: null,
+          kind: "user_input",
+          status: "pending",
+          responseCapability: { type: "live", providerSessionId },
+          createdAt: now,
+          resolvedAt: null,
+        };
+        const beforeWrite = yield* Deferred.make<void>();
+        const releaseWrite = yield* Deferred.make<void>();
+        const commandStarted = yield* Deferred.make<void>();
+        const commandRead = yield* Deferred.make<void>();
+        const ingestor = yield* ProviderEventIngestor.ProviderEventIngestorV2.pipe(
+          Effect.provide(Layer.fresh(ProviderEventIngestor.layer)),
+          Effect.provideService(
+            EventSink.EventSinkV2,
+            EventSink.EventSinkV2.of({
+              ...eventSink,
+              write: (input) =>
+                Deferred.succeed(beforeWrite, undefined).pipe(
+                  Effect.andThen(Deferred.await(releaseWrite)),
+                  Effect.andThen(eventSink.write(input)),
+                ),
+            }),
+          ),
+        );
+        const ingestion = yield* ingestor
+          .ingestNormalized({
+            providerSessionId,
+            providerInstanceId: modelSelection.instanceId,
+            threadId,
+            event: {
+              type: "runtime_request.updated",
+              driver: CODEX_DRIVER,
+              runtimeRequest: request,
+            },
+          })
+          .pipe(Effect.forkScoped);
+        yield* Deferred.await(beforeWrite);
+        const command = yield* Deferred.succeed(commandStarted, undefined).pipe(
+          Effect.andThen(
+            threadCommands.withLock(
+              threadId,
+              Deferred.succeed(commandRead, undefined).pipe(
+                Effect.andThen(projections.getThreadRecords(threadId, ["runtimeRequests"])),
+              ),
+            ),
+          ),
+          Effect.forkScoped,
+        );
+        yield* Deferred.await(commandStarted);
+        // A command cannot observe the normalized question before its transaction commits.
+        assert.isFalse(yield* Deferred.isDone(commandRead));
+        yield* Deferred.succeed(releaseWrite, undefined);
+        yield* Fiber.join(ingestion);
+        const state = yield* Fiber.join(command);
+        assert.equal(state.runtimeRequests.find((row) => row.id === request.id)?.status, "pending");
+      }),
+    ),
+  );
+
   it.effect("persists a failed provider terminal as one expected error item", () =>
     Effect.gen(function* () {
       const now = yield* DateTime.now;

@@ -226,8 +226,8 @@ export const executorLayer: Layer.Layer<
                 Effect.catch((error) =>
                   Effect.gen(function* () {
                     if (
-                      !("turnCompleted" in error) ||
-                      !error.turnCompleted ||
+                      ((!("turnCompleted" in error) || !error.turnCompleted) &&
+                        !("backgroundDeferred" in error && error.backgroundDeferred)) ||
                       effect.request.type !== "provider-turn.steer"
                     ) {
                       return yield* error;
@@ -251,6 +251,7 @@ export const executorLayer: Layer.Layer<
                       text: message.text,
                       ...(message.context ? { context: message.context } : {}),
                       attachments: message.attachments,
+                      ...(message.backgroundDelivery ? { deliveryIntent: "background" } : {}),
                       // A user's follow-up starts on the thread's saved selection,
                       // which already holds the steer's choice. A delegated
                       // completion stays pinned to the run it reports to.
@@ -259,7 +260,8 @@ export const executorLayer: Layer.Layer<
                         : { modelSelection: run.modelSelection }),
                       dispatchMode: {
                         type:
-                          message.delegatedCompletion === undefined
+                          message.delegatedCompletion === undefined &&
+                          !("backgroundDeferred" in error && error.backgroundDeferred)
                             ? "start_immediately"
                             : "queue_after_active",
                       },
