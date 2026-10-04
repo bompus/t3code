@@ -39,6 +39,7 @@ import * as ProviderTurnStart from "./ProviderTurnStartService.ts";
 import * as RunExecutionService from "./RunExecutionService.ts";
 import * as RuntimePolicy from "./RuntimePolicy.ts";
 import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
+import { makeKeyedSerialExecutor } from "./KeyedSerialExecutor.ts";
 
 const isDomainEvent = Schema.is(OrchestrationV2DomainEvent);
 
@@ -174,7 +175,7 @@ function makeLocalCommandHarness(input: {
   readonly writeFailure?: unknown;
   /** Loads the thread and starts the run, then fails every later state read. */
   readonly failReadsAfterRunning?: boolean;
-  readonly pendingBackgroundQuestion?: "before-open" | "during-open";
+  readonly pendingBackgroundQuestion?: "before-open" | "during-open" | "after-final-check";
 }) {
   const now = DateTime.makeUnsafe("2026-09-04T12:00:00Z");
   const threadId = ThreadId.make("thread-native-account-command");
@@ -361,6 +362,7 @@ function makeLocalCommandHarness(input: {
     };
   }
   const events: Array<OrchestrationV2DomainEvent> = [];
+  const runningWritesWithPendingQuestion: Array<boolean> = [];
   const interruptRun = () => {
     projection = {
       ...projection,
@@ -423,7 +425,7 @@ function makeLocalCommandHarness(input: {
           driver: providerThread.driver,
           ensureThread: () =>
             Effect.sync(() => {
-              ask();
+              if (input.pendingBackgroundQuestion === "during-open") ask();
               return providerThread;
             }),
         } as never)
@@ -447,7 +449,8 @@ function makeLocalCommandHarness(input: {
                     ),
                   ),
                 )
-              : input.failReadsAfterRunning === true
+              : input.failReadsAfterRunning === true ||
+                  input.pendingBackgroundQuestion === "after-final-check"
                 ? Effect.succeed({
                     driver: providerThread.driver,
                     providerSession: {
@@ -468,10 +471,14 @@ function makeLocalCommandHarness(input: {
   );
   const startRootRun = vi.fn<
     (input: RunExecutionService.RunExecutionServiceV2StartRootRunInput) => Effect.Effect<void>
-  >(() =>
-    input.failReadsAfterRunning === true
-      ? Effect.void
-      : Effect.die("A local command must not start a native turn."),
+  >((runInput) =>
+    input.pendingBackgroundQuestion === "after-final-check"
+      ? Effect.gen(function* () {
+          expect(yield* runInput.shouldStartProviderTurn!().pipe(Effect.orDie)).toBe(false);
+        })
+      : input.failReadsAfterRunning === true
+        ? Effect.void
+        : Effect.die("A local command must not start a native turn."),
   );
   const failReadIfRunning = Effect.suspend(() =>
     input.failReadsAfterRunning === true &&
@@ -509,12 +516,36 @@ function makeLocalCommandHarness(input: {
           if (committed) {
             for (const event of incoming) {
               expect(isDomainEvent(event)).toBe(true);
+              if (event.type === "run.updated" && event.payload.status === "running") {
+                runningWritesWithPendingQuestion.push(
+                  projection.runtimeRequests.some((request) => request.status === "pending"),
+                );
+              }
               events.push(event);
               projection = ProjectionStore.applyToProjection(projection, event);
             }
           }
           return { committed, storedEvents: [] };
         }),
+  );
+  const commandExecutorLayer = Layer.effect(
+    ThreadCommandExecutor.ThreadCommandExecutor,
+    Effect.gen(function* () {
+      const executor = yield* makeKeyedSerialExecutor<ThreadId>();
+      let completedChecks = 0;
+      return {
+        withLock: <A, E, R>(key: ThreadId, effect: Effect.Effect<A, E, R>) =>
+          executor.withLock(key, effect).pipe(
+            Effect.tap(() => {
+              completedChecks++;
+              return input.pendingBackgroundQuestion === "after-final-check" &&
+                completedChecks === 2
+                ? executor.withLock(key, Effect.sync(ask))
+                : Effect.void;
+            }),
+          ),
+      };
+    }),
   );
   const layer = ProviderTurnStart.layer.pipe(
     Layer.provide(
@@ -524,7 +555,7 @@ function makeLocalCommandHarness(input: {
         }),
         Layer.mock(EventSink.EventSinkV2)({ writeIfRunCurrent }),
         IdAllocator.layer,
-        ThreadCommandExecutor.layer,
+        commandExecutorLayer,
         FileSystem.layerNoop({}),
         Layer.mock(GitWorkflow.GitWorkflowService)({}),
         Layer.mock(ProjectService.ProjectService)({}),
@@ -571,6 +602,7 @@ function makeLocalCommandHarness(input: {
     startRootRun,
     tryHandlePromptCommand,
     events,
+    runningWritesWithPendingQuestion,
     oldInstanceId,
     newInstanceId,
     attemptId,
@@ -919,3 +951,24 @@ for (const when of ["before-open", "during-open"] as const) {
     }),
   );
 }
+
+effectIt.effect(
+  "serializes the final background check and running commit with question ingestion",
+  () =>
+    Effect.gen(function* () {
+      const harness = makeLocalCommandHarness({
+        text: "Read the inbox.",
+        pendingBackgroundQuestion: "after-final-check",
+      });
+      yield* harness.start;
+      expect(harness.runningWritesWithPendingQuestion).toEqual([false]);
+      expect(harness.projection().runtimeRequests[0]?.status).toBe("pending");
+      expect(harness.projection().runs.at(-1)).toMatchObject({
+        status: "queued",
+        backgroundDeferrals: 1,
+      });
+      expect(harness.projection().nodes[0]?.status).toBe("pending");
+      expect(harness.projection().attempts[0]?.status).toBe("pending");
+      expect(harness.startRootRun).toHaveBeenCalledOnce();
+    }),
+);

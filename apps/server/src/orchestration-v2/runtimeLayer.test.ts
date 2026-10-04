@@ -71,7 +71,11 @@ import * as ProjectionStore from "./ProjectionStore.ts";
 import * as PullRequestWatchReactor from "./PullRequestWatchReactor.ts";
 import * as PullRequestService from "../pullRequest/PullRequestService.ts";
 import * as ProjectStore from "./ProjectStore.ts";
-import type { ProviderAdapterV2SessionRuntime, ProviderAdapterV2Shape } from "./ProviderAdapter.ts";
+import {
+  ProviderAdapterCapabilitiesError,
+  type ProviderAdapterV2SessionRuntime,
+  type ProviderAdapterV2Shape,
+} from "./ProviderAdapter.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 import {
   OrchestrationEventInfrastructureLayerLive,
@@ -808,6 +812,112 @@ it.layer(TestLayer)("background message delivery", (it) => {
         }
       }
     }),
+  );
+
+  it.effect.each(["starting", "failed"] as const)(
+    "selects ordinary work ahead of held mail and attributes %s promotion",
+    (result) => {
+      let restoreCapabilities = () => {};
+      return Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const sink = yield* EventSink.EventSinkV2;
+        const threadId = ThreadId.make(`background-ordinary-queue-precedence-${result}`);
+        yield* create(threadId);
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make(`${threadId}-active`),
+          threadId,
+          messageId: MessageId.make(`${threadId}-active`),
+          text: "Active user work",
+          attachments: [],
+          dispatchMode: { type: "start_immediately" },
+          createdBy: "user",
+          creationSource: "web",
+        });
+        yield* seedBackgroundQuestion(String(threadId), threadId);
+        const delivered = yield* mail(threadId);
+        const ordinaryMessageId = MessageId.make(`${threadId}-ordinary`);
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make(`${threadId}-ordinary`),
+          threadId,
+          messageId: ordinaryMessageId,
+          text: "Human follow-up",
+          attachments: [],
+          dispatchMode: { type: "queue_after_active" },
+          createdBy: "user",
+          creationSource: "web",
+        });
+        const before = yield* orchestrator.getThreadProjection(threadId);
+        const active = before.runs.find((run) => run.status === "starting")!;
+        const now = yield* DateTime.now;
+        if (result === "failed") {
+          let failedOnce = false;
+          const capabilities = vi
+            .spyOn(orchestrationAdapter, "getCapabilities")
+            .mockImplementation(() =>
+              Effect.suspend(() => {
+                if (failedOnce) return Effect.succeed(CodexProviderCapabilitiesV2);
+                failedOnce = true;
+                return Effect.gen(function* () {
+                  yield* sink
+                    .write({
+                      events: [
+                        {
+                          id: EventId.make(`${threadId}-question-release`),
+                          type: "runtime-request.updated",
+                          threadId,
+                          occurredAt: now,
+                          payload: {
+                            ...before.runtimeRequests[0]!,
+                            status: "cancelled",
+                            resolvedAt: now,
+                          },
+                        },
+                      ],
+                    })
+                    .pipe(Effect.orDie);
+                  return yield* new ProviderAdapterCapabilitiesError({
+                    driver,
+                    cause: "Synthetic capability read failure",
+                  });
+                });
+              }),
+            );
+          restoreCapabilities = () => capabilities.mockRestore();
+        }
+        yield* sink.write({
+          events: [
+            {
+              id: EventId.make(`${threadId}-complete`),
+              type: "run.updated",
+              threadId,
+              runId: active.id,
+              occurredAt: now,
+              payload: { ...active, status: "completed", completedAt: now },
+            },
+          ],
+        });
+        yield* orchestrator.dispatch({
+          type: "queue.resume",
+          commandId: CommandId.make(`${threadId}-resume`),
+          threadId,
+        });
+        const after = yield* orchestrator.getThreadProjection(threadId);
+        if (result === "starting")
+          assert.equal(after.runs.find((run) => run.id === delivered.run.id)?.status, "queued");
+        else
+          assert.notEqual(after.runs.find((run) => run.id === delivered.run.id)?.status, "failed");
+        assert.equal(
+          after.runs.find((run) => run.userMessageId === ordinaryMessageId)?.status,
+          result,
+        );
+        assert.equal(
+          after.runtimeRequests[0]?.status,
+          result === "starting" ? "pending" : "cancelled",
+        );
+      }).pipe(Effect.ensuring(Effect.sync(() => restoreCapabilities())));
+    },
   );
 
   it.effect("requires every pending question to clear before promoting mail", () =>

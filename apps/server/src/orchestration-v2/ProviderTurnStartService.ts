@@ -116,85 +116,83 @@ export const layer: Layer.Layer<
 
     // Only called before native delivery. Requeue the unstarted run rather than leaving
     // it active while a human answer needs to start its own turn.
-    const deferBackgroundRun = (threadId: ThreadId, runId: RunId) =>
-      threadCommands
-        .withLock(
-          threadId,
+    const deferBackgroundRunLocked = (threadId: ThreadId, runId: RunId) =>
+      Effect.gen(function* () {
+        const current = yield* projectionStore.getThreadRecords(threadId, [
+          "runs",
+          "nodes",
+          "attempts",
+          "runtimeRequests",
+        ]);
+        const run = current.runs.find((row) => row.id === runId);
+        if (
+          run === undefined ||
+          (run.status !== "starting" && run.status !== "running") ||
+          !hasPendingHumanRequest(current.runtimeRequests)
+        )
+          return false;
+        const node = current.nodes.find((row) => row.id === run.rootNodeId);
+        const attempt = current.attempts.find((row) => row.id === run.activeAttemptId);
+        if (node === undefined || attempt === undefined)
+          return yield* new ProjectionStore.ProjectionStoreReadError({
+            threadId,
+            cause: "Background run has no unstarted execution identity.",
+          });
+        const now = yield* DateTime.now;
+        const payloads = [
+          {
+            type: "run.updated" as const,
+            payload: {
+              ...run,
+              status: "queued" as const,
+              startedAt: null,
+              queuePosition:
+                Math.max(
+                  0,
+                  ...current.runs
+                    .filter((row) => row.status === "queued")
+                    .map((row) => row.queuePosition ?? row.ordinal),
+                ) + 1,
+              backgroundDeferrals: (run.backgroundDeferrals ?? 0) + 1,
+            },
+          },
+          {
+            type: "run-attempt.updated" as const,
+            payload: { ...attempt, status: "pending" as const, startedAt: null },
+          },
+          {
+            type: "node.updated" as const,
+            payload: { ...node, status: "pending" as const, startedAt: null },
+          },
+        ];
+        const events = yield* Effect.forEach(payloads, (event) =>
           Effect.gen(function* () {
-            const current = yield* projectionStore.getThreadRecords(threadId, [
-              "runs",
-              "nodes",
-              "attempts",
-              "runtimeRequests",
-            ]);
-            const run = current.runs.find((row) => row.id === runId);
-            if (
-              run === undefined ||
-              (run.status !== "starting" && run.status !== "running") ||
-              !hasPendingHumanRequest(current.runtimeRequests)
-            )
-              return false;
-            const node = current.nodes.find((row) => row.id === run.rootNodeId);
-            const attempt = current.attempts.find((row) => row.id === run.activeAttemptId);
-            if (node === undefined || attempt === undefined)
-              return yield* new ProjectionStore.ProjectionStoreReadError({
-                threadId,
-                cause: "Background run has no unstarted execution identity.",
-              });
-            const now = yield* DateTime.now;
-            const payloads = [
-              {
-                type: "run.updated" as const,
-                payload: {
-                  ...run,
-                  status: "queued" as const,
-                  startedAt: null,
-                  queuePosition:
-                    Math.max(
-                      0,
-                      ...current.runs
-                        .filter((row) => row.status === "queued")
-                        .map((row) => row.queuePosition ?? row.ordinal),
-                    ) + 1,
-                  backgroundDeferrals: (run.backgroundDeferrals ?? 0) + 1,
-                },
-              },
-              {
-                type: "run-attempt.updated" as const,
-                payload: { ...attempt, status: "pending" as const, startedAt: null },
-              },
-              {
-                type: "node.updated" as const,
-                payload: { ...node, status: "pending" as const, startedAt: null },
-              },
-            ];
-            const events = yield* Effect.forEach(payloads, (event) =>
-              Effect.gen(function* () {
-                return {
-                  ...event,
-                  id: yield* idAllocator.allocate.event({ threadId }),
-                  threadId,
-                  runId,
-                  nodeId: node.id,
-                  occurredAt: now,
-                };
-              }),
-            );
-            const result = yield* eventSink.writeIfRunCurrent({
+            return {
+              ...event,
+              id: yield* idAllocator.allocate.event({ threadId }),
               threadId,
               runId,
-              activeAttemptId: attempt.id,
-              expectedStatus: run.status,
-              events,
-            });
-            return result.committed;
+              nodeId: node.id,
+              occurredAt: now,
+            };
           }),
-        )
-        .pipe(
-          Effect.mapError(
-            (cause) => new ProjectionStore.ProjectionStoreReadError({ threadId, cause }),
-          ),
         );
+        const result = yield* eventSink.writeIfRunCurrent({
+          threadId,
+          runId,
+          activeAttemptId: attempt.id,
+          expectedStatus: run.status,
+          events,
+        });
+        return result.committed;
+      }).pipe(
+        Effect.mapError(
+          (cause) => new ProjectionStore.ProjectionStoreReadError({ threadId, cause }),
+        ),
+      );
+
+    const deferBackgroundRun = (threadId: ThreadId, runId: RunId) =>
+      threadCommands.withLock(threadId, deferBackgroundRunLocked(threadId, runId));
 
     // These callbacks outlive startup while a run drains background work. Build
     // them outside start's scope so they cannot retain its full thread history.
@@ -1026,15 +1024,23 @@ export const layer: Layer.Layer<
           payload: runningRootNode,
         },
       ];
-      if (message.backgroundDelivery && (yield* deferBackgroundRun(input.threadId, runId))) return;
-      const runningWrite = yield* eventSink.writeIfRunCurrent({
+      const commitRunning = eventSink.writeIfRunCurrent({
         threadId: projection.thread.id,
         runId: run.id,
         activeAttemptId: attempt.id,
         expectedStatus: "starting",
         events,
       });
-      if (!runningWrite.committed) {
+      const runningWrite = yield* message.backgroundDelivery
+        ? threadCommands.withLock(
+            input.threadId,
+            Effect.gen(function* () {
+              if (yield* deferBackgroundRunLocked(input.threadId, runId)) return null;
+              return yield* commitRunning;
+            }),
+          )
+        : commitRunning;
+      if (runningWrite === null || !runningWrite.committed) {
         return;
       }
       const routableSubagents = projection.subagents.filter((subagent) =>

@@ -547,9 +547,14 @@ function delegatedTaskTerminalStatus(
 }
 
 function nextQueuedRun(
-  projection: Pick<OrchestrationV2ThreadProjection, "runs" | "messages">,
+  projection: Pick<OrchestrationV2ThreadProjection, "runs" | "messages" | "runtimeRequests">,
 ): OrchestrationV2Run | undefined {
-  return queuedRunsInDeliveryOrder(projection)[0];
+  const holdBackground = hasPendingHumanRequest(projection.runtimeRequests);
+  return queuedRunsInDeliveryOrder(projection).find(
+    (run) =>
+      !holdBackground ||
+      !projection.messages.find((message) => message.id === run.userMessageId)?.backgroundDelivery,
+  );
 }
 
 function latestStableRun(
@@ -1106,14 +1111,16 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       }
     });
 
-  const failQueuedRunStart = (threadId: ThreadId, cause: unknown) =>
+  const failQueuedRunStart = (threadId: ThreadId, selectedRunId: RunId, cause: unknown) =>
     Effect.gen(function* () {
       const projection = yield* projectionStore.getThreadRecords(
         threadId,
         ["runs", "nodes", "attempts", "providerThreads", "turnItems", "messages"],
         { turnItemTypes: [], messageRoles: ["user"] },
       );
-      const queuedRun = nextQueuedRun(projection);
+      const queuedRun = projection.runs.find(
+        (run) => run.id === selectedRunId && run.status === "queued",
+      );
       if (queuedRun === undefined) return;
       const now = yield* DateTime.now;
       const rootNode = projection.nodes.find((node) => node.id === queuedRun.rootNodeId);
@@ -1212,277 +1219,123 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     });
 
   const startNextQueuedRun = (threadId: ThreadId, options?: { readonly failedRunId?: RunId }) =>
-    Effect.gen(function* () {
-      // Every terminal run checks the queue. Only a deliverable queued run
-      // needs the transcript for provider handoff and legacy import context.
-      if (!(yield* projectionStore.canStartQueuedRun(threadId))) return;
-      const projection = yield* readCommandProjection(threadId);
-      if (
-        projection.thread.archivedAt !== null ||
-        projection.thread.deletedAt !== null ||
-        projection.runs.some(isBlockingRun) ||
-        projection.runs.some((run) => run.status === "queued" && run.queueHeld === true)
-      ) {
-        return;
-      }
+    Effect.suspend(() => {
+      let selectedRunId: RunId | undefined;
+      return Effect.gen(function* () {
+        // Every terminal run checks the queue. Only a deliverable queued run
+        // needs the transcript for provider handoff and legacy import context.
+        if (!(yield* projectionStore.canStartQueuedRun(threadId))) return;
+        const projection = yield* readCommandProjection(threadId);
+        if (
+          projection.thread.archivedAt !== null ||
+          projection.thread.deletedAt !== null ||
+          projection.runs.some(isBlockingRun) ||
+          projection.runs.some((run) => run.status === "queued" && run.queueHeld === true)
+        ) {
+          return;
+        }
 
-      // The limit already stopped this thread. Starting the queue would send
-      // every waiting message and drop it from the queue as each one fails.
-      const sessionError =
-        projection.providerSessions
-          .filter((session) => session.providerInstanceId === projection.thread.providerInstanceId)
-          .toSorted(
-            (left, right) =>
-              DateTime.toEpochMillis(right.updatedAt) - DateTime.toEpochMillis(left.updatedAt),
-          )[0]?.lastError ?? null;
-      if (usageLimitBlockedRun(projection.runs, projection.turnItems, sessionError) !== null) {
-        return;
-      }
-      const queuedRun = nextQueuedRun(projection);
-      if (queuedRun === undefined) {
-        return;
-      }
-      // A provider that just failed will likely fail the next message too.
-      // Hold the queue so the user decides when to resume it. Validation
-      // failures (setup, unsupported handoff) belong to that message alone,
-      // and a message queued for another provider is how users recover.
-      const failedRun = latestExecutedRun(projection.runs);
-      const failureClass =
-        failedRun?.id === options?.failedRunId
-          ? latestRootProviderFailure(failedRun, projection.turnItems)?.class
-          : undefined;
-      if (
-        failureClass !== undefined &&
-        failureClass !== "validation_error" &&
-        failedRun?.providerInstanceId === queuedRun.providerInstanceId
-      ) {
-        const now = yield* DateTime.now;
-        yield* writeSystemEvents(
-          projection.runs
-            .filter((run) => run.status === "queued")
-            .map((run) => ({
-              type: "run.updated" as const,
-              threadId,
-              runId: run.id,
-              providerInstanceId: run.providerInstanceId,
-              occurredAt: now,
-              payload: { ...run, queueHeld: true },
-            })),
-        );
-        return;
-      }
-      const rootNodeId = queuedRun.rootNodeId;
-      const attemptId = queuedRun.activeAttemptId;
-      const providerThreadId = queuedRun.providerThreadId;
-      if (rootNodeId === null || attemptId === null || providerThreadId === null) {
-        return yield* new OrchestratorDispatchError({
-          commandId: CommandId.make(`command:system:start-queued:${queuedRun.id}`),
-          commandType: "message.dispatch",
-          cause: `Queued run ${queuedRun.id} is missing execution identity.`,
-        });
-      }
-
-      const rootNode = projection.nodes.find((candidate) => candidate.id === rootNodeId);
-      const attempt = projection.attempts.find((candidate) => candidate.id === attemptId);
-      const queuedMessage = projection.messages.find(
-        (candidate) => candidate.id === queuedRun.userMessageId,
-      );
-      if (queuedMessage?.backgroundDelivery && hasPendingHumanRequest(projection.runtimeRequests))
-        return;
-      const legacyQueuedTurnItem = projection.turnItems.find(
-        (
-          candidate,
-        ): candidate is Extract<OrchestrationV2TurnItem, { readonly type: "user_message" }> =>
-          candidate.type === "user_message" &&
-          candidate.runId === queuedRun.id &&
-          candidate.messageId === queuedRun.userMessageId,
-      );
-      const queuedProviderThread = projection.providerThreads.find(
-        (candidate) => candidate.id === providerThreadId,
-      );
-      const storedCheckpointScope = projection.checkpointScopes.find(
-        (scope) => scope.id === rootNode?.checkpointScopeId,
-      );
-      if (
-        rootNode === undefined ||
-        attempt === undefined ||
-        queuedMessage === undefined ||
-        queuedProviderThread === undefined ||
-        (rootNode.checkpointScopeId !== null && storedCheckpointScope === undefined)
-      ) {
-        return yield* new OrchestratorDispatchError({
-          commandId: CommandId.make(`command:system:start-queued:${queuedRun.id}`),
-          commandType: "message.dispatch",
-          cause: `Queued run ${queuedRun.id} is missing projection state.`,
-        });
-      }
-
-      const commandId = CommandId.make(`command:system:start-queued:${queuedRun.id}`);
-      const now = yield* DateTime.now;
-      const selectionChanged = !modelSelectionsEqual(
-        projection.thread.modelSelection,
-        queuedRun.modelSelection,
-      );
-      const switchPlan = selectionChanged
-        ? yield* providerSwitchService
-            .plan({ projection, targetModelSelection: queuedRun.modelSelection })
-            .pipe(
-              Effect.mapError(
-                (cause) =>
-                  new OrchestratorDispatchError({
-                    commandId,
-                    commandType: "message.dispatch",
-                    cause,
-                  }),
-              ),
+        // The limit already stopped this thread. Starting the queue would send
+        // every waiting message and drop it from the queue as each one fails.
+        const sessionError =
+          projection.providerSessions
+            .filter(
+              (session) => session.providerInstanceId === projection.thread.providerInstanceId,
             )
-        : null;
-      const activeProviderThread = projection.providerThreads.find(
-        (candidate) => candidate.id === projection.thread.activeProviderThreadId,
-      );
-      const canResumeAcrossInstances =
-        switchPlan?.instanceChanged === true &&
-        switchPlan.transition.type === "restart_and_resume" &&
-        activeProviderThread !== undefined &&
-        activeProviderThread.nativeThreadRef !== null;
-      const deliveryProviderThread =
-        canResumeAcrossInstances && activeProviderThread !== undefined
-          ? {
-              ...queuedProviderThread,
-              nativeThreadRef: activeProviderThread.nativeThreadRef,
-              nativeConversationHeadRef: activeProviderThread.nativeConversationHeadRef,
-              nativeMetadata: activeProviderThread.nativeMetadata,
-            }
-          : queuedProviderThread;
-      const targetAdapter = yield* providerAdapters.get(queuedRun.providerInstanceId).pipe(
-        Effect.mapError(
-          (cause) =>
-            new OrchestratorDispatchError({
-              commandId,
-              commandType: "message.dispatch",
-              cause,
-            }),
-        ),
-      );
-      const targetCapabilities = yield* targetAdapter.getCapabilities().pipe(
-        Effect.mapError(
-          (cause) =>
-            new OrchestratorDispatchError({
-              commandId,
-              commandType: "message.dispatch",
-              cause,
-            }),
-        ),
-      );
-      const latestCompletedRun = projection.runs.findLast((run) => run.status === "completed");
-      const latestHandoffRun = projection.runs.findLast(isHandoffSourceRun);
-      const targetLastCompletedRun = lastDeliveredRunForProviderThread(
-        projection,
-        queuedProviderThread.id,
-      );
-      const coveredRuns =
-        canResumeAcrossInstances ||
-        latestHandoffRun === undefined ||
-        latestHandoffRun.providerInstanceId === queuedRun.providerInstanceId
-          ? []
-          : projection.runs.filter(
-              (run) =>
-                isHandoffSourceRun(run) &&
-                run.ordinal > (targetLastCompletedRun?.ordinal ?? 0) &&
-                run.ordinal <= latestHandoffRun.ordinal,
-            );
-      const needsFullContext = deliveryProviderThread.nativeThreadRef === null;
-      const legacyImportItems =
-        projection.thread.historyOrigin === "v1_import"
-          ? yield* readHandoffItems(threadId, [null])
-          : [];
-      const handoffStrategy = needsFullContext
-        ? ("full_thread_summary" as const)
-        : ("delta_since_target_last_seen" as const);
-      const transferId =
-        coveredRuns.length === 0
-          ? null
-          : yield* idAllocator.allocate
-              .contextTransfer({
-                sourceThreadId: threadId,
-                targetThreadId: threadId,
-                type: "provider_handoff",
-              })
-              .pipe(
-                Effect.mapError(
-                  (cause) =>
-                    new OrchestratorDispatchError({
-                      commandId,
-                      commandType: "message.dispatch",
-                      cause,
-                    }),
-                ),
-              );
-      if (transferId !== null) {
-        yield* commandPolicy.ensureContextHandoff({
-          commandId,
-          threadId,
-          providerInstanceId: queuedRun.providerInstanceId,
-          capabilities: targetCapabilities,
-          strategy: needsFullContext ? "full_thread_summary" : "delta_context",
-        });
-      }
-      const handoff =
-        transferId === null || latestHandoffRun === undefined
-          ? null
-          : yield* contextHandoffService
-              .prepareProviderHandoff({
+            .toSorted(
+              (left, right) =>
+                DateTime.toEpochMillis(right.updatedAt) - DateTime.toEpochMillis(left.updatedAt),
+            )[0]?.lastError ?? null;
+        if (usageLimitBlockedRun(projection.runs, projection.turnItems, sessionError) !== null) {
+          return;
+        }
+        const queuedRun = nextQueuedRun(projection);
+        if (queuedRun === undefined) {
+          return;
+        }
+        selectedRunId = queuedRun.id;
+        // A provider that just failed will likely fail the next message too.
+        // Hold the queue so the user decides when to resume it. Validation
+        // failures (setup, unsupported handoff) belong to that message alone,
+        // and a message queued for another provider is how users recover.
+        const failedRun = latestExecutedRun(projection.runs);
+        const failureClass =
+          failedRun?.id === options?.failedRunId
+            ? latestRootProviderFailure(failedRun, projection.turnItems)?.class
+            : undefined;
+        if (
+          failureClass !== undefined &&
+          failureClass !== "validation_error" &&
+          failedRun?.providerInstanceId === queuedRun.providerInstanceId
+        ) {
+          const now = yield* DateTime.now;
+          yield* writeSystemEvents(
+            projection.runs
+              .filter((run) => run.status === "queued")
+              .map((run) => ({
+                type: "run.updated" as const,
                 threadId,
-                targetRunId: queuedRun.id,
-                transferId,
-                fromProviderThreadIds: Array.from(
-                  new Set(
-                    coveredRuns.flatMap((run) =>
-                      run.providerThreadId === null ? [] : [run.providerThreadId],
-                    ),
-                  ),
-                ),
-                toProviderThreadId: queuedProviderThread.id,
-                fromProviderInstanceId: latestHandoffRun.providerInstanceId,
-                toProviderInstanceId: queuedRun.providerInstanceId,
-                coveredRunOrdinals: {
-                  from: coveredRuns[0]!.ordinal,
-                  to: coveredRuns.at(-1)!.ordinal,
-                },
-                runs: projection.runs,
-                strategy: handoffStrategy,
-                items: [
-                  ...(needsFullContext && latestCompletedRun !== undefined
-                    ? legacyImportItems
-                    : []),
-                  ...(yield* readHandoffItems(
-                    threadId,
-                    coveredRuns.map((run) => run.id),
-                  )),
-                ],
-                createdAt: now,
-              })
-              .pipe(
-                Effect.mapError(
-                  (cause) =>
-                    new OrchestratorDispatchError({
-                      commandId,
-                      commandType: "message.dispatch",
-                      cause,
-                    }),
-                ),
-              );
-      const legacyImportRecoveryHandoff =
-        latestCompletedRun === undefined && needsFullContext && legacyImportItems.length > 0
-          ? yield* contextHandoffService
-              .prepareLegacyImport({
-                threadId,
-                targetRunId: queuedRun.id,
-                toProviderThreadId: queuedProviderThread.id,
-                toProviderInstanceId: queuedRun.providerInstanceId,
-                items: legacyImportItems,
-                createdAt: now,
-              })
+                runId: run.id,
+                providerInstanceId: run.providerInstanceId,
+                occurredAt: now,
+                payload: { ...run, queueHeld: true },
+              })),
+          );
+          return;
+        }
+        const rootNodeId = queuedRun.rootNodeId;
+        const attemptId = queuedRun.activeAttemptId;
+        const providerThreadId = queuedRun.providerThreadId;
+        if (rootNodeId === null || attemptId === null || providerThreadId === null) {
+          return yield* new OrchestratorDispatchError({
+            commandId: CommandId.make(`command:system:start-queued:${queuedRun.id}`),
+            commandType: "message.dispatch",
+            cause: `Queued run ${queuedRun.id} is missing execution identity.`,
+          });
+        }
+
+        const rootNode = projection.nodes.find((candidate) => candidate.id === rootNodeId);
+        const attempt = projection.attempts.find((candidate) => candidate.id === attemptId);
+        const queuedMessage = projection.messages.find(
+          (candidate) => candidate.id === queuedRun.userMessageId,
+        );
+        const legacyQueuedTurnItem = projection.turnItems.find(
+          (
+            candidate,
+          ): candidate is Extract<OrchestrationV2TurnItem, { readonly type: "user_message" }> =>
+            candidate.type === "user_message" &&
+            candidate.runId === queuedRun.id &&
+            candidate.messageId === queuedRun.userMessageId,
+        );
+        const queuedProviderThread = projection.providerThreads.find(
+          (candidate) => candidate.id === providerThreadId,
+        );
+        const storedCheckpointScope = projection.checkpointScopes.find(
+          (scope) => scope.id === rootNode?.checkpointScopeId,
+        );
+        if (
+          rootNode === undefined ||
+          attempt === undefined ||
+          queuedMessage === undefined ||
+          queuedProviderThread === undefined ||
+          (rootNode.checkpointScopeId !== null && storedCheckpointScope === undefined)
+        ) {
+          return yield* new OrchestratorDispatchError({
+            commandId: CommandId.make(`command:system:start-queued:${queuedRun.id}`),
+            commandType: "message.dispatch",
+            cause: `Queued run ${queuedRun.id} is missing projection state.`,
+          });
+        }
+
+        const commandId = CommandId.make(`command:system:start-queued:${queuedRun.id}`);
+        const now = yield* DateTime.now;
+        const selectionChanged = !modelSelectionsEqual(
+          projection.thread.modelSelection,
+          queuedRun.modelSelection,
+        );
+        const switchPlan = selectionChanged
+          ? yield* providerSwitchService
+              .plan({ projection, targetModelSelection: queuedRun.modelSelection })
               .pipe(
                 Effect.mapError(
                   (cause) =>
@@ -1494,20 +1347,200 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                 ),
               )
           : null;
-      const activeHandoff = handoff ?? legacyImportRecoveryHandoff;
-      const checkpointScope =
-        storedCheckpointScope ??
-        (yield* runtimePolicy
-          .resolve({ thread: projection.thread, modelSelection: queuedRun.modelSelection })
-          .pipe(
-            Effect.flatMap((resolvedRuntimePolicy) =>
-              checkpointService.prepareRootRunScope({
+        const activeProviderThread = projection.providerThreads.find(
+          (candidate) => candidate.id === projection.thread.activeProviderThreadId,
+        );
+        const canResumeAcrossInstances =
+          switchPlan?.instanceChanged === true &&
+          switchPlan.transition.type === "restart_and_resume" &&
+          activeProviderThread !== undefined &&
+          activeProviderThread.nativeThreadRef !== null;
+        const deliveryProviderThread =
+          canResumeAcrossInstances && activeProviderThread !== undefined
+            ? {
+                ...queuedProviderThread,
+                nativeThreadRef: activeProviderThread.nativeThreadRef,
+                nativeConversationHeadRef: activeProviderThread.nativeConversationHeadRef,
+                nativeMetadata: activeProviderThread.nativeMetadata,
+              }
+            : queuedProviderThread;
+        const targetAdapter = yield* providerAdapters.get(queuedRun.providerInstanceId).pipe(
+          Effect.mapError(
+            (cause) =>
+              new OrchestratorDispatchError({
+                commandId,
+                commandType: "message.dispatch",
+                cause,
+              }),
+          ),
+        );
+        const targetCapabilities = yield* targetAdapter.getCapabilities().pipe(
+          Effect.mapError(
+            (cause) =>
+              new OrchestratorDispatchError({
+                commandId,
+                commandType: "message.dispatch",
+                cause,
+              }),
+          ),
+        );
+        const latestCompletedRun = projection.runs.findLast((run) => run.status === "completed");
+        const latestHandoffRun = projection.runs.findLast(isHandoffSourceRun);
+        const targetLastCompletedRun = lastDeliveredRunForProviderThread(
+          projection,
+          queuedProviderThread.id,
+        );
+        const coveredRuns =
+          canResumeAcrossInstances ||
+          latestHandoffRun === undefined ||
+          latestHandoffRun.providerInstanceId === queuedRun.providerInstanceId
+            ? []
+            : projection.runs.filter(
+                (run) =>
+                  isHandoffSourceRun(run) &&
+                  run.ordinal > (targetLastCompletedRun?.ordinal ?? 0) &&
+                  run.ordinal <= latestHandoffRun.ordinal,
+              );
+        const needsFullContext = deliveryProviderThread.nativeThreadRef === null;
+        const legacyImportItems =
+          projection.thread.historyOrigin === "v1_import"
+            ? yield* readHandoffItems(threadId, [null])
+            : [];
+        const handoffStrategy = needsFullContext
+          ? ("full_thread_summary" as const)
+          : ("delta_since_target_last_seen" as const);
+        const transferId =
+          coveredRuns.length === 0
+            ? null
+            : yield* idAllocator.allocate
+                .contextTransfer({
+                  sourceThreadId: threadId,
+                  targetThreadId: threadId,
+                  type: "provider_handoff",
+                })
+                .pipe(
+                  Effect.mapError(
+                    (cause) =>
+                      new OrchestratorDispatchError({
+                        commandId,
+                        commandType: "message.dispatch",
+                        cause,
+                      }),
+                  ),
+                );
+        if (transferId !== null) {
+          yield* commandPolicy.ensureContextHandoff({
+            commandId,
+            threadId,
+            providerInstanceId: queuedRun.providerInstanceId,
+            capabilities: targetCapabilities,
+            strategy: needsFullContext ? "full_thread_summary" : "delta_context",
+          });
+        }
+        const handoff =
+          transferId === null || latestHandoffRun === undefined
+            ? null
+            : yield* contextHandoffService
+                .prepareProviderHandoff({
+                  threadId,
+                  targetRunId: queuedRun.id,
+                  transferId,
+                  fromProviderThreadIds: Array.from(
+                    new Set(
+                      coveredRuns.flatMap((run) =>
+                        run.providerThreadId === null ? [] : [run.providerThreadId],
+                      ),
+                    ),
+                  ),
+                  toProviderThreadId: queuedProviderThread.id,
+                  fromProviderInstanceId: latestHandoffRun.providerInstanceId,
+                  toProviderInstanceId: queuedRun.providerInstanceId,
+                  coveredRunOrdinals: {
+                    from: coveredRuns[0]!.ordinal,
+                    to: coveredRuns.at(-1)!.ordinal,
+                  },
+                  runs: projection.runs,
+                  strategy: handoffStrategy,
+                  items: [
+                    ...(needsFullContext && latestCompletedRun !== undefined
+                      ? legacyImportItems
+                      : []),
+                    ...(yield* readHandoffItems(
+                      threadId,
+                      coveredRuns.map((run) => run.id),
+                    )),
+                  ],
+                  createdAt: now,
+                })
+                .pipe(
+                  Effect.mapError(
+                    (cause) =>
+                      new OrchestratorDispatchError({
+                        commandId,
+                        commandType: "message.dispatch",
+                        cause,
+                      }),
+                  ),
+                );
+        const legacyImportRecoveryHandoff =
+          latestCompletedRun === undefined && needsFullContext && legacyImportItems.length > 0
+            ? yield* contextHandoffService
+                .prepareLegacyImport({
+                  threadId,
+                  targetRunId: queuedRun.id,
+                  toProviderThreadId: queuedProviderThread.id,
+                  toProviderInstanceId: queuedRun.providerInstanceId,
+                  items: legacyImportItems,
+                  createdAt: now,
+                })
+                .pipe(
+                  Effect.mapError(
+                    (cause) =>
+                      new OrchestratorDispatchError({
+                        commandId,
+                        commandType: "message.dispatch",
+                        cause,
+                      }),
+                  ),
+                )
+            : null;
+        const activeHandoff = handoff ?? legacyImportRecoveryHandoff;
+        const checkpointScope =
+          storedCheckpointScope ??
+          (yield* runtimePolicy
+            .resolve({ thread: projection.thread, modelSelection: queuedRun.modelSelection })
+            .pipe(
+              Effect.flatMap((resolvedRuntimePolicy) =>
+                checkpointService.prepareRootRunScope({
+                  threadId,
+                  runId: queuedRun.id,
+                  rootNodeId: rootNode.id,
+                  providerThreadId: queuedProviderThread.id,
+                  cwd: resolvedRuntimePolicy.cwd ?? projection.thread.worktreePath ?? process.cwd(),
+                  createdAt: now,
+                }),
+              ),
+              Effect.mapError(
+                (cause) =>
+                  new OrchestratorDispatchError({
+                    commandId,
+                    commandType: "message.dispatch",
+                    cause,
+                  }),
+              ),
+            ));
+        const providerSessionId =
+          (!canResumeAcrossInstances &&
+          queuedProviderThread.providerSessionId !== null &&
+          !switchPlan?.releaseProviderSessionIds.includes(queuedProviderThread.providerSessionId)
+            ? queuedProviderThread.providerSessionId
+            : null) ??
+          (yield* providerAdapters.get(queuedRun.providerInstanceId).pipe(
+            Effect.flatMap((adapter) =>
+              providerSessionIdFor({
+                adapter,
+                providerInstanceId: queuedRun.providerInstanceId,
                 threadId,
-                runId: queuedRun.id,
-                rootNodeId: rootNode.id,
-                providerThreadId: queuedProviderThread.id,
-                cwd: resolvedRuntimePolicy.cwd ?? projection.thread.worktreePath ?? process.cwd(),
-                createdAt: now,
               }),
             ),
             Effect.mapError(
@@ -1519,305 +1552,289 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                 }),
             ),
           ));
-      const providerSessionId =
-        (!canResumeAcrossInstances &&
-        queuedProviderThread.providerSessionId !== null &&
-        !switchPlan?.releaseProviderSessionIds.includes(queuedProviderThread.providerSessionId)
-          ? queuedProviderThread.providerSessionId
-          : null) ??
-        (yield* providerAdapters.get(queuedRun.providerInstanceId).pipe(
-          Effect.flatMap((adapter) =>
-            providerSessionIdFor({
-              adapter,
-              providerInstanceId: queuedRun.providerInstanceId,
-              threadId,
-            }),
+        const providerThread: OrchestrationV2ProviderThread = {
+          ...deliveryProviderThread,
+          providerSessionId,
+          status: "not_loaded",
+          firstRunOrdinal: queuedProviderThread.firstRunOrdinal ?? queuedRun.ordinal,
+          lastRunOrdinal: queuedRun.ordinal,
+          handoffIds: appendContextHandoffId(
+            appendContextHandoffId(queuedProviderThread.handoffIds, handoff?.id ?? null),
+            legacyImportRecoveryHandoff?.id ?? null,
           ),
-          Effect.mapError(
-            (cause) =>
-              new OrchestratorDispatchError({
-                commandId,
-                commandType: "message.dispatch",
-                cause,
-              }),
-          ),
-        ));
-      const providerThread: OrchestrationV2ProviderThread = {
-        ...deliveryProviderThread,
-        providerSessionId,
-        status: "not_loaded",
-        firstRunOrdinal: queuedProviderThread.firstRunOrdinal ?? queuedRun.ordinal,
-        lastRunOrdinal: queuedRun.ordinal,
-        handoffIds: appendContextHandoffId(
-          appendContextHandoffId(queuedProviderThread.handoffIds, handoff?.id ?? null),
-          legacyImportRecoveryHandoff?.id ?? null,
-        ),
-        updatedAt: now,
-      };
-      const startingRun: OrchestrationV2Run = {
-        ...queuedRun,
-        status: "starting",
-        queuePosition: null,
-        startedAt: null,
-        contextHandoffId: activeHandoff?.id ?? null,
-        ...wakeWorkStartedAt(projection.runs, {
-          notification: queuedMessage.notification,
-          delegatedCompletion: queuedMessage.delegatedCompletion,
-          restartContinuationOfRunId: queuedRun.restartContinuationOfRunId,
-        }),
-      };
-      const userTurnItem: OrchestrationV2TurnItem = {
-        ...(legacyQueuedTurnItem ?? {
-          id: idAllocator.derive.userTurnItem({ messageId: queuedMessage.id }),
-          threadId,
-          runId: queuedRun.id,
-          nodeId: rootNodeId,
-          providerThreadId: queuedProviderThread.id,
-          providerTurnId: null,
-          nativeItemRef: null,
-          parentItemId: null,
-          ordinal: queuedRun.ordinal * 100,
-          status: "completed",
-          title: null,
-          type: "user_message",
-          messageId: queuedMessage.id,
-          text: queuedMessage.text,
-          attachments: queuedMessage.attachments,
-          ...(queuedMessage.context ? { context: queuedMessage.context } : {}),
-          createdBy: queuedMessage.createdBy,
-          creationSource: queuedMessage.creationSource,
-          ...(queuedMessage.scheduledTaskId === undefined
-            ? {}
-            : { scheduledTaskId: queuedMessage.scheduledTaskId }),
-          ...(queuedMessage.senderThreadId === undefined
-            ? {}
-            : { senderThreadId: queuedMessage.senderThreadId }),
-        }),
-        inputIntent: "queued_turn",
-        startedAt: now,
-        completedAt: now,
-        updatedAt: now,
-      };
-      const handoffTurnItem: OrchestrationV2TurnItem | null =
-        activeHandoff === null
-          ? null
-          : {
-              id: idAllocator.derive.runSignalTurnItem({
+          updatedAt: now,
+        };
+        const startingRun: OrchestrationV2Run = {
+          ...queuedRun,
+          status: "starting",
+          queuePosition: null,
+          startedAt: null,
+          contextHandoffId: activeHandoff?.id ?? null,
+          ...wakeWorkStartedAt(projection.runs, {
+            notification: queuedMessage.notification,
+            delegatedCompletion: queuedMessage.delegatedCompletion,
+            restartContinuationOfRunId: queuedRun.restartContinuationOfRunId,
+          }),
+        };
+        const userTurnItem: OrchestrationV2TurnItem = {
+          ...(legacyQueuedTurnItem ?? {
+            id: idAllocator.derive.userTurnItem({ messageId: queuedMessage.id }),
+            threadId,
+            runId: queuedRun.id,
+            nodeId: rootNodeId,
+            providerThreadId: queuedProviderThread.id,
+            providerTurnId: null,
+            nativeItemRef: null,
+            parentItemId: null,
+            ordinal: queuedRun.ordinal * 100,
+            status: "completed",
+            title: null,
+            type: "user_message",
+            messageId: queuedMessage.id,
+            text: queuedMessage.text,
+            attachments: queuedMessage.attachments,
+            ...(queuedMessage.context ? { context: queuedMessage.context } : {}),
+            createdBy: queuedMessage.createdBy,
+            creationSource: queuedMessage.creationSource,
+            ...(queuedMessage.scheduledTaskId === undefined
+              ? {}
+              : { scheduledTaskId: queuedMessage.scheduledTaskId }),
+            ...(queuedMessage.senderThreadId === undefined
+              ? {}
+              : { senderThreadId: queuedMessage.senderThreadId }),
+          }),
+          inputIntent: "queued_turn",
+          startedAt: now,
+          completedAt: now,
+          updatedAt: now,
+        };
+        const handoffTurnItem: OrchestrationV2TurnItem | null =
+          activeHandoff === null
+            ? null
+            : {
+                id: idAllocator.derive.runSignalTurnItem({
+                  runId: queuedRun.id,
+                  signal: `context-handoff:${activeHandoff.id}`,
+                }),
+                threadId,
                 runId: queuedRun.id,
-                signal: `context-handoff:${activeHandoff.id}`,
-              }),
+                nodeId: rootNodeId,
+                providerThreadId: queuedProviderThread.id,
+                providerTurnId: null,
+                nativeItemRef: null,
+                parentItemId: null,
+                ordinal: queuedRun.ordinal * 100 - 1,
+                status: "completed",
+                title: handoff === null ? "Imported context" : "Provider handoff",
+                startedAt: now,
+                completedAt: now,
+                updatedAt: now,
+                type: "handoff",
+                contextHandoffId: activeHandoff.id,
+                fromProviderThreadIds: activeHandoff.fromProviderThreadIds,
+                toProviderThreadId: activeHandoff.toProviderThreadId,
+                fromProviderInstanceIds: Array.from(
+                  new Set(coveredRuns.map((run) => run.providerInstanceId)),
+                ),
+                toProviderInstanceId: queuedRun.providerInstanceId,
+                fromModelSelections: Array.from(
+                  new Map(
+                    coveredRuns.map((run) => [
+                      `${run.modelSelection.instanceId}\0${run.modelSelection.model}`,
+                      run.modelSelection,
+                    ]),
+                  ).values(),
+                ),
+                toModel: queuedRun.modelSelection.model,
+                strategy: activeHandoff.strategy,
+                summary: activeHandoff.summaryText,
+              };
+        const checkpointEvents: ReadonlyArray<Omit<OrchestrationV2DomainEvent, "id">> =
+          storedCheckpointScope === undefined
+            ? [
+                {
+                  type: "checkpoint-scope.created",
+                  threadId,
+                  runId: queuedRun.id,
+                  nodeId: rootNode.id,
+                  providerInstanceId: queuedRun.providerInstanceId,
+                  occurredAt: now,
+                  payload: checkpointScope,
+                },
+                {
+                  type: "node.updated",
+                  threadId,
+                  runId: queuedRun.id,
+                  nodeId: rootNode.id,
+                  providerInstanceId: queuedRun.providerInstanceId,
+                  occurredAt: now,
+                  payload: { ...rootNode, checkpointScopeId: checkpointScope.id },
+                },
+              ]
+            : [];
+        const sessionsToDetach = projection.providerSessions.filter(
+          (session) =>
+            switchPlan?.releaseProviderSessionIds.includes(session.id) &&
+            session.status !== "stopped" &&
+            session.status !== "error",
+        );
+        yield* writeSystemEvents(
+          [
+            ...(selectionChanged
+              ? [
+                  {
+                    type:
+                      queuedRun.providerInstanceId === projection.thread.providerInstanceId
+                        ? ("thread.model-selection-updated" as const)
+                        : ("thread.provider-switched" as const),
+                    threadId,
+                    providerInstanceId: queuedRun.providerInstanceId,
+                    occurredAt: now,
+                    payload: {
+                      ...projection.thread,
+                      providerInstanceId: queuedRun.providerInstanceId,
+                      modelSelection: queuedRun.modelSelection,
+                      updatedAt: now,
+                    },
+                  },
+                ]
+              : []),
+            ...(handoff === null || transferId === null || latestHandoffRun === undefined
+              ? []
+              : [
+                  {
+                    type: "context-transfer.created" as const,
+                    threadId,
+                    runId: queuedRun.id,
+                    providerInstanceId: queuedRun.providerInstanceId,
+                    occurredAt: now,
+                    payload: {
+                      id: transferId,
+                      type: "provider_handoff" as const,
+                      sourceThreadId: threadId,
+                      targetThreadId: threadId,
+                      sourcePoint: contextSourcePointForRun(projection, latestHandoffRun),
+                      basePoint:
+                        needsFullContext || targetLastCompletedRun === undefined
+                          ? null
+                          : contextSourcePointForRun(projection, targetLastCompletedRun),
+                      sourceProviderInstanceId: latestHandoffRun.providerInstanceId,
+                      targetProviderInstanceId: queuedRun.providerInstanceId,
+                      targetRunId: queuedRun.id,
+                      status: "consumed" as const,
+                      resolution: {
+                        strategy: needsFullContext
+                          ? ("portable_context" as const)
+                          : ("delta_context" as const),
+                        contextHandoffId: handoff.id,
+                      },
+                      createdBy: queuedMessage.createdBy,
+                      error: null,
+                      createdAt: now,
+                      updatedAt: now,
+                      consumedAt: now,
+                    },
+                  },
+                  {
+                    type: "context-handoff.updated" as const,
+                    threadId,
+                    runId: queuedRun.id,
+                    providerInstanceId: queuedRun.providerInstanceId,
+                    occurredAt: now,
+                    payload: handoff,
+                  },
+                ]),
+            ...(legacyImportRecoveryHandoff === null
+              ? []
+              : [
+                  {
+                    type: "context-handoff.updated" as const,
+                    threadId,
+                    runId: queuedRun.id,
+                    providerInstanceId: queuedRun.providerInstanceId,
+                    occurredAt: now,
+                    payload: legacyImportRecoveryHandoff,
+                  },
+                ]),
+            ...(handoffTurnItem === null
+              ? []
+              : [
+                  {
+                    type: "turn-item.updated" as const,
+                    threadId,
+                    runId: queuedRun.id,
+                    nodeId: rootNodeId,
+                    providerInstanceId: queuedRun.providerInstanceId,
+                    occurredAt: now,
+                    payload: handoffTurnItem,
+                  },
+                ]),
+            ...sessionsToDetach.map((session) => ({
+              type: "provider-session.detached" as const,
+              threadId,
+              driver: session.driver,
+              providerInstanceId: session.providerInstanceId,
+              occurredAt: now,
+              payload: {
+                providerSessionId: session.id,
+                detachedAt: now,
+                reason: "Provider or model selection changed.",
+              },
+            })),
+            ...checkpointEvents,
+            {
+              type: "provider-thread.updated",
+              threadId,
+              providerInstanceId: queuedRun.providerInstanceId,
+              occurredAt: now,
+              payload: providerThread,
+            },
+            {
+              type: "turn-item.updated",
               threadId,
               runId: queuedRun.id,
               nodeId: rootNodeId,
-              providerThreadId: queuedProviderThread.id,
-              providerTurnId: null,
-              nativeItemRef: null,
-              parentItemId: null,
-              ordinal: queuedRun.ordinal * 100 - 1,
-              status: "completed",
-              title: handoff === null ? "Imported context" : "Provider handoff",
-              startedAt: now,
-              completedAt: now,
-              updatedAt: now,
-              type: "handoff",
-              contextHandoffId: activeHandoff.id,
-              fromProviderThreadIds: activeHandoff.fromProviderThreadIds,
-              toProviderThreadId: activeHandoff.toProviderThreadId,
-              fromProviderInstanceIds: Array.from(
-                new Set(coveredRuns.map((run) => run.providerInstanceId)),
-              ),
-              toProviderInstanceId: queuedRun.providerInstanceId,
-              fromModelSelections: Array.from(
-                new Map(
-                  coveredRuns.map((run) => [
-                    `${run.modelSelection.instanceId}\0${run.modelSelection.model}`,
-                    run.modelSelection,
-                  ]),
-                ).values(),
-              ),
-              toModel: queuedRun.modelSelection.model,
-              strategy: activeHandoff.strategy,
-              summary: activeHandoff.summaryText,
-            };
-      const checkpointEvents: ReadonlyArray<Omit<OrchestrationV2DomainEvent, "id">> =
-        storedCheckpointScope === undefined
-          ? [
-              {
-                type: "checkpoint-scope.created",
-                threadId,
-                runId: queuedRun.id,
-                nodeId: rootNode.id,
-                providerInstanceId: queuedRun.providerInstanceId,
-                occurredAt: now,
-                payload: checkpointScope,
-              },
-              {
-                type: "node.updated",
-                threadId,
-                runId: queuedRun.id,
-                nodeId: rootNode.id,
-                providerInstanceId: queuedRun.providerInstanceId,
-                occurredAt: now,
-                payload: { ...rootNode, checkpointScopeId: checkpointScope.id },
-              },
-            ]
-          : [];
-      const sessionsToDetach = projection.providerSessions.filter(
-        (session) =>
-          switchPlan?.releaseProviderSessionIds.includes(session.id) &&
-          session.status !== "stopped" &&
-          session.status !== "error",
-      );
-      yield* writeSystemEvents(
-        [
-          ...(selectionChanged
-            ? [
-                {
-                  type:
-                    queuedRun.providerInstanceId === projection.thread.providerInstanceId
-                      ? ("thread.model-selection-updated" as const)
-                      : ("thread.provider-switched" as const),
-                  threadId,
-                  providerInstanceId: queuedRun.providerInstanceId,
-                  occurredAt: now,
-                  payload: {
-                    ...projection.thread,
-                    providerInstanceId: queuedRun.providerInstanceId,
-                    modelSelection: queuedRun.modelSelection,
-                    updatedAt: now,
-                  },
-                },
-              ]
-            : []),
-          ...(handoff === null || transferId === null || latestHandoffRun === undefined
-            ? []
-            : [
-                {
-                  type: "context-transfer.created" as const,
-                  threadId,
-                  runId: queuedRun.id,
-                  providerInstanceId: queuedRun.providerInstanceId,
-                  occurredAt: now,
-                  payload: {
-                    id: transferId,
-                    type: "provider_handoff" as const,
-                    sourceThreadId: threadId,
-                    targetThreadId: threadId,
-                    sourcePoint: contextSourcePointForRun(projection, latestHandoffRun),
-                    basePoint:
-                      needsFullContext || targetLastCompletedRun === undefined
-                        ? null
-                        : contextSourcePointForRun(projection, targetLastCompletedRun),
-                    sourceProviderInstanceId: latestHandoffRun.providerInstanceId,
-                    targetProviderInstanceId: queuedRun.providerInstanceId,
-                    targetRunId: queuedRun.id,
-                    status: "consumed" as const,
-                    resolution: {
-                      strategy: needsFullContext
-                        ? ("portable_context" as const)
-                        : ("delta_context" as const),
-                      contextHandoffId: handoff.id,
-                    },
-                    createdBy: queuedMessage.createdBy,
-                    error: null,
-                    createdAt: now,
-                    updatedAt: now,
-                    consumedAt: now,
-                  },
-                },
-                {
-                  type: "context-handoff.updated" as const,
-                  threadId,
-                  runId: queuedRun.id,
-                  providerInstanceId: queuedRun.providerInstanceId,
-                  occurredAt: now,
-                  payload: handoff,
-                },
-              ]),
-          ...(legacyImportRecoveryHandoff === null
-            ? []
-            : [
-                {
-                  type: "context-handoff.updated" as const,
-                  threadId,
-                  runId: queuedRun.id,
-                  providerInstanceId: queuedRun.providerInstanceId,
-                  occurredAt: now,
-                  payload: legacyImportRecoveryHandoff,
-                },
-              ]),
-          ...(handoffTurnItem === null
-            ? []
-            : [
-                {
-                  type: "turn-item.updated" as const,
-                  threadId,
-                  runId: queuedRun.id,
-                  nodeId: rootNodeId,
-                  providerInstanceId: queuedRun.providerInstanceId,
-                  occurredAt: now,
-                  payload: handoffTurnItem,
-                },
-              ]),
-          ...sessionsToDetach.map((session) => ({
-            type: "provider-session.detached" as const,
-            threadId,
-            driver: session.driver,
-            providerInstanceId: session.providerInstanceId,
-            occurredAt: now,
-            payload: {
-              providerSessionId: session.id,
-              detachedAt: now,
-              reason: "Provider or model selection changed.",
+              providerInstanceId: queuedRun.providerInstanceId,
+              occurredAt: now,
+              payload: notificationTurnItem(userTurnItem, queuedMessage, projection.subagents),
             },
-          })),
-          ...checkpointEvents,
-          {
-            type: "provider-thread.updated",
-            threadId,
-            providerInstanceId: queuedRun.providerInstanceId,
-            occurredAt: now,
-            payload: providerThread,
-          },
-          {
-            type: "turn-item.updated",
-            threadId,
-            runId: queuedRun.id,
-            nodeId: rootNodeId,
-            providerInstanceId: queuedRun.providerInstanceId,
-            occurredAt: now,
-            payload: notificationTurnItem(userTurnItem, queuedMessage, projection.subagents),
-          },
-          {
-            type: "run.updated",
-            threadId,
-            runId: queuedRun.id,
-            nodeId: rootNodeId,
-            providerInstanceId: queuedRun.providerInstanceId,
-            occurredAt: now,
-            payload: startingRun,
-          },
-        ],
-        [
-          ...sessionsToDetach.map((session) => ({
-            id: `effect:${commandId}:provider-session.detach:${session.id}`,
-            commandId,
-            threadId,
-            request: {
-              type: "provider-session.detach" as const,
-              providerSessionId: session.id,
-              detail: "Provider or model selection changed.",
+            {
+              type: "run.updated",
+              threadId,
+              runId: queuedRun.id,
+              nodeId: rootNodeId,
+              providerInstanceId: queuedRun.providerInstanceId,
+              occurredAt: now,
+              payload: startingRun,
             },
-          })),
-          {
-            id: `effect:${commandId}:provider-turn.start:${queuedRun.id}${queuedRun.backgroundDeferrals === undefined ? "" : `:background-${queuedRun.backgroundDeferrals}`}`,
-            commandId,
-            threadId,
-            request: { type: "provider-turn.start", runId: queuedRun.id },
-          },
-        ],
+          ],
+          [
+            ...sessionsToDetach.map((session) => ({
+              id: `effect:${commandId}:provider-session.detach:${session.id}`,
+              commandId,
+              threadId,
+              request: {
+                type: "provider-session.detach" as const,
+                providerSessionId: session.id,
+                detail: "Provider or model selection changed.",
+              },
+            })),
+            {
+              id: `effect:${commandId}:provider-turn.start:${queuedRun.id}${queuedRun.backgroundDeferrals === undefined ? "" : `:background-${queuedRun.backgroundDeferrals}`}`,
+              commandId,
+              threadId,
+              request: { type: "provider-turn.start", runId: queuedRun.id },
+            },
+          ],
+        );
+      }).pipe(
+        Effect.catch((cause) =>
+          selectedRunId === undefined
+            ? Effect.fail(cause)
+            : failQueuedRunStart(threadId, selectedRunId, cause),
+        ),
       );
-    }).pipe(Effect.catch((cause) => failQueuedRunStart(threadId, cause)));
+    });
 
   const resumeQueuedRuns = Effect.gen(function* () {
     const threadIds = yield* projectionStore.getRecoveryThreadIds("queued-runs");
@@ -9975,7 +9992,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       Stream.filter(
         (stored) =>
           stored.event.type === "runtime-request.updated" &&
-          stored.event.payload.status !== "pending",
+          stored.event.payload.status !== "pending" &&
+          hasPendingHumanRequest([{ ...stored.event.payload, status: "pending" }]),
       ),
       Stream.runForEach((stored) =>
         threadDispatch
