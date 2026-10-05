@@ -17,6 +17,7 @@ import {
   type OrchestrationV2ThreadProjection,
   OrchestrationV2DomainEvent,
 } from "@t3tools/contracts";
+import * as KeyedLock from "@t3tools/shared/KeyedLock";
 import * as Cause from "effect/Cause";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -39,7 +40,6 @@ import * as ProviderTurnStart from "./ProviderTurnStartService.ts";
 import * as RunExecutionService from "./RunExecutionService.ts";
 import * as RuntimePolicy from "./RuntimePolicy.ts";
 import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
-import { makeKeyedSerialExecutor } from "./KeyedSerialExecutor.ts";
 
 const isDomainEvent = Schema.is(OrchestrationV2DomainEvent);
 
@@ -531,9 +531,10 @@ function makeLocalCommandHarness(input: {
   const commandExecutorLayer = Layer.effect(
     ThreadCommandExecutor.ThreadCommandExecutor,
     Effect.gen(function* () {
-      const executor = yield* makeKeyedSerialExecutor<ThreadId>();
+      const executor = yield* KeyedLock.make<ThreadId>();
       let completedChecks = 0;
       return {
+        ...executor,
         withLock: <A, E, R>(key: ThreadId, effect: Effect.Effect<A, E, R>) =>
           executor.withLock(key, effect).pipe(
             Effect.tap(() => {

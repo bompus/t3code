@@ -326,156 +326,177 @@ it.effect(
     }),
 );
 
-it.effect.each(["question", "capability-change", "session-missing", "clear"] as const)(
-  "checks background steering at execution time: %s",
-  (condition) =>
-    Effect.gen(function* () {
-      const now = yield* DateTime.now;
-      const threadId = ThreadId.make("thread:background-control");
-      const providerSessionId = ProviderSessionId.make("session:background-control");
-      const providerThreadId = ProviderThreadId.make("provider-thread:background-control");
-      const providerTurnId = ProviderTurnId.make("provider-turn:background-control");
-      const runId = RunId.make("run:background-control");
-      const nodeId = NodeId.make("node:background-control");
-      const messageId = MessageId.make("message:background-control");
-      const providerThread: OrchestrationV2ProviderThread = {
-        id: providerThreadId,
-        driver,
-        providerInstanceId,
-        providerSessionId,
-        appThreadId: threadId,
-        ownerNodeId: null,
-        nativeThreadRef: null,
-        nativeConversationHeadRef: null,
-        status: "active",
-        firstRunOrdinal: 1,
-        lastRunOrdinal: 1,
-        handoffIds: [],
-        forkedFrom: null,
-        createdAt: now,
-        updatedAt: now,
-      };
-      const providerTurn = makeProjection({
-        now,
-        threadId,
-        providerThread,
-        providerTurnId,
-        attemptId: RunAttemptId.make("attempt:background-control"),
-      }).providerTurns[0]!;
-      const run: OrchestrationV2ThreadProjection["runs"][number] = {
-        id: runId,
-        threadId,
-        ordinal: 1,
-        providerInstanceId,
-        modelSelection,
-        providerThreadId,
-        userMessageId: messageId,
-        rootNodeId: nodeId,
-        activeAttemptId: null,
-        status: "running",
-        requestedAt: now,
-        startedAt: now,
-        completedAt: null,
-        checkpointId: null,
-        contextHandoffId: null,
-      };
-      const message: OrchestrationV2ThreadProjection["messages"][number] = {
-        id: messageId,
-        threadId,
-        runId,
-        nodeId,
-        role: "user",
-        text: "Background notification",
-        backgroundDelivery: true,
-        attachments: [],
-        streaming: false,
-        createdBy: "system",
-        creationSource: "mcp",
-        createdAt: now,
-        updatedAt: now,
-      };
-      const calls = yield* Ref.make<ReadonlyArray<string>>([]);
-      const providerSession = {
-        id: providerSessionId,
-        driver,
-        providerInstanceId,
-        status: "running" as const,
-        cwd: "/workspace",
-        model: modelSelection.model,
-        createdAt: now,
-        updatedAt: now,
-        lastError: null,
-        capabilities: {
-          ...CodexProviderCapabilitiesV2,
-          turns: {
-            ...CodexProviderCapabilitiesV2.turns,
-            supportsActiveSteering: condition !== "capability-change",
-          },
+it.effect.each([
+  "question",
+  "capability-change",
+  "interrupting-steering",
+  "explicit-interrupting-steering",
+  "session-missing",
+  "clear",
+] as const)("checks steering eligibility at execution time: %s", (condition) =>
+  Effect.gen(function* () {
+    const now = yield* DateTime.now;
+    const threadId = ThreadId.make("thread:background-control");
+    const providerSessionId = ProviderSessionId.make("session:background-control");
+    const providerThreadId = ProviderThreadId.make("provider-thread:background-control");
+    const providerTurnId = ProviderTurnId.make("provider-turn:background-control");
+    const runId = RunId.make("run:background-control");
+    const nodeId = NodeId.make("node:background-control");
+    const messageId = MessageId.make("message:background-control");
+    const providerThread: OrchestrationV2ProviderThread = {
+      id: providerThreadId,
+      driver,
+      providerInstanceId,
+      providerSessionId,
+      appThreadId: threadId,
+      ownerNodeId: null,
+      nativeThreadRef: null,
+      nativeConversationHeadRef: null,
+      status: "active",
+      firstRunOrdinal: 1,
+      lastRunOrdinal: 1,
+      handoffIds: [],
+      forkedFrom: null,
+      createdAt: now,
+      updatedAt: now,
+    };
+    const providerTurn = makeProjection({
+      now,
+      threadId,
+      providerThread,
+      providerTurnId,
+      attemptId: RunAttemptId.make("attempt:background-control"),
+    }).providerTurns[0]!;
+    const run: OrchestrationV2ThreadProjection["runs"][number] = {
+      id: runId,
+      threadId,
+      ordinal: 1,
+      providerInstanceId,
+      modelSelection,
+      providerThreadId,
+      userMessageId: messageId,
+      rootNodeId: nodeId,
+      activeAttemptId: null,
+      status: "running",
+      requestedAt: now,
+      startedAt: now,
+      completedAt: null,
+      checkpointId: null,
+      contextHandoffId: null,
+    };
+    const message: OrchestrationV2ThreadProjection["messages"][number] = {
+      id: messageId,
+      threadId,
+      runId,
+      nodeId,
+      role: "user",
+      text: "Background notification",
+      ...(condition === "explicit-interrupting-steering"
+        ? {}
+        : { backgroundDelivery: true as const }),
+      attachments: [],
+      streaming: false,
+      createdBy: "system",
+      creationSource: "mcp",
+      createdAt: now,
+      updatedAt: now,
+    };
+    const calls = yield* Ref.make<ReadonlyArray<string>>([]);
+    const providerSession = {
+      id: providerSessionId,
+      driver,
+      providerInstanceId,
+      status: "running" as const,
+      cwd: "/workspace",
+      model: modelSelection.model,
+      createdAt: now,
+      updatedAt: now,
+      lastError: null,
+      capabilities: {
+        ...CodexProviderCapabilitiesV2,
+        turns: {
+          ...CodexProviderCapabilitiesV2.turns,
+          supportsActiveSteering: condition !== "capability-change",
+          activeSteeringInterruptsTools:
+            condition === "interrupting-steering" || condition === "explicit-interrupting-steering",
         },
-      };
-      const runtime: ProviderAdapterV2SessionRuntime = {
-        instanceId: providerInstanceId,
-        driver,
+      },
+    };
+    const runtime: ProviderAdapterV2SessionRuntime = {
+      instanceId: providerInstanceId,
+      driver,
+      providerSessionId,
+      providerSession,
+      events: Stream.empty,
+      ensureThread: () => Effect.die("unused"),
+      resumeThread: () => Effect.die("unused"),
+      startTurn: () => Effect.die("background must not restart"),
+      steerTurn: () => Ref.update(calls, (previous) => [...previous, "steer"]),
+      interruptTurn: () => Effect.die("background must not interrupt"),
+      respondToRuntimeRequest: () => Effect.die("background must not answer"),
+      readThreadSnapshot: () => Effect.die("unused"),
+      rollbackThread: () => Effect.die("unused"),
+      forkThread: () => Effect.die("unused"),
+    };
+    const layer = ProviderTurnControlService.layer.pipe(
+      Layer.provide(
+        Layer.mergeAll(
+          Layer.mock(ProjectionStore.ProjectionStoreV2)({
+            getProviderControlContext: () =>
+              Effect.succeed({ providerThread, providerTurn, run, message, attempt: undefined }),
+            getThreadRecords: <K extends ProjectionStore.ProjectionRecordField>() =>
+              Effect.succeed({
+                runtimeRequests:
+                  condition === "question"
+                    ? [
+                        {
+                          id: RuntimeRequestId.make("question:background-control"),
+                          nodeId,
+                          providerTurnId,
+                          nativeRequestRef: null,
+                          kind: "user_input" as const,
+                          status: "pending" as const,
+                          responseCapability: { type: "live" as const, providerSessionId },
+                          createdAt: now,
+                          resolvedAt: null,
+                        },
+                      ]
+                    : [],
+              } as unknown as ProjectionStore.ProjectionRecords<K>),
+          }),
+          Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({
+            get: () =>
+              Effect.succeed(
+                condition === "session-missing" ? Option.none() : Option.some(runtime),
+              ),
+          }),
+        ),
+      ),
+    );
+    yield* Effect.gen(function* () {
+      const control = yield* ProviderTurnControlService.ProviderTurnControlServiceV2;
+      const operation = control.steer({
+        threadId,
         providerSessionId,
-        providerSession,
-        events: Stream.empty,
-        ensureThread: () => Effect.die("unused"),
-        resumeThread: () => Effect.die("unused"),
-        startTurn: () => Effect.die("background must not restart"),
-        steerTurn: () => Ref.update(calls, (previous) => [...previous, "steer"]),
-        interruptTurn: () => Effect.die("background must not interrupt"),
-        respondToRuntimeRequest: () => Effect.die("background must not answer"),
-        readThreadSnapshot: () => Effect.die("unused"),
-        rollbackThread: () => Effect.die("unused"),
-        forkThread: () => Effect.die("unused"),
-      };
-      const layer = ProviderTurnControlService.layer.pipe(
-        Layer.provide(
-          Layer.mergeAll(
-            Layer.mock(ProjectionStore.ProjectionStoreV2)({
-              getProviderControlContext: () =>
-                Effect.succeed({ providerThread, providerTurn, run, message, attempt: undefined }),
-              getThreadRecords: <K extends ProjectionStore.ProjectionRecordField>() =>
-                Effect.succeed({
-                  runtimeRequests:
-                    condition === "question"
-                      ? [
-                          {
-                            id: RuntimeRequestId.make("question:background-control"),
-                            nodeId,
-                            providerTurnId,
-                            nativeRequestRef: null,
-                            kind: "user_input" as const,
-                            status: "pending" as const,
-                            responseCapability: { type: "live" as const, providerSessionId },
-                            createdAt: now,
-                            resolvedAt: null,
-                          },
-                        ]
-                      : [],
-                } as unknown as ProjectionStore.ProjectionRecords<K>),
-            }),
-            Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({
-              get: () =>
-                Effect.succeed(
-                  condition === "session-missing" ? Option.none() : Option.some(runtime),
-                ),
+        providerThreadId,
+        providerTurnId,
+        messageId,
+      });
+      if (condition === "clear" || condition === "explicit-interrupting-steering") yield* operation;
+      else
+        assert.isTrue(
+          yield* operation.pipe(
+            Effect.match({
+              onFailure: (error) => error.backgroundDeferred === true,
+              onSuccess: () => false,
             }),
           ),
-        ),
-      );
-      yield* Effect.gen(function* () {
-        const control = yield* ProviderTurnControlService.ProviderTurnControlServiceV2;
-        const operation = control.steer({
-          threadId,
-          providerSessionId,
-          providerThreadId,
-          providerTurnId,
-          messageId,
-        });
-        if (condition === "clear") yield* operation;
-        else assert.isTrue((yield* operation.pipe(Effect.flip)).backgroundDeferred);
-      }).pipe(Effect.provide(layer));
-      assert.deepEqual(yield* Ref.get(calls), condition === "clear" ? ["steer"] : []);
-    }),
+          "background steering must defer",
+        );
+    }).pipe(Effect.provide(layer));
+    assert.deepEqual(
+      yield* Ref.get(calls),
+      condition === "clear" || condition === "explicit-interrupting-steering" ? ["steer"] : [],
+    );
+  }),
 );

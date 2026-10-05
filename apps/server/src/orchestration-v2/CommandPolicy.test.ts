@@ -11,6 +11,7 @@ import {
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 
+import { ClaudeProviderCapabilitiesV2 } from "./Adapters/ClaudeAdapterV2.ts";
 import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
 import { CursorProviderCapabilitiesV2 } from "./Adapters/CursorAdapterV2.ts";
 import { GrokProviderCapabilitiesV2 } from "./Adapters/GrokAdapterV2.ts";
@@ -107,6 +108,22 @@ it("background delivery holds human requests and never chooses interrupt-restart
     { type: "start_immediately" },
   );
 });
+
+it.each(["background", "auto", "steer"] as const)(
+  "preserves explicit steering while background avoids interrupting tools: %s",
+  (intent) => {
+    assert.deepEqual(
+      CommandPolicy.resolveMessageDispatchIntent(
+        dispatchProjection(ClaudeProviderCapabilitiesV2),
+        { type: "start_immediately" },
+        intent,
+      ),
+      intent === "background"
+        ? { type: "queue_after_active" }
+        : { type: "steer_active", targetRunId: activeRunId },
+    );
+  },
+);
 
 it("resolves automatic message delivery from authoritative provider capabilities", () => {
   assert.deepEqual(

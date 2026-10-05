@@ -310,7 +310,9 @@ export const layer: Layer.Layer<
             ]);
             if (
               hasPendingHumanRequest(requests.runtimeRequests) ||
-              !loaded.session.value.providerSession.capabilities.turns.supportsActiveSteering
+              !loaded.session.value.providerSession.capabilities.turns.supportsActiveSteering ||
+              loaded.session.value.providerSession.capabilities.turns
+                .activeSteeringInterruptsTools === true
             )
               return yield* new ProviderTurnControlError({
                 threadId: input.threadId,

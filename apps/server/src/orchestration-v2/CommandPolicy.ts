@@ -169,7 +169,10 @@ export function resolveMessageDispatchIntent(
           (candidate) => candidate.id === providerThread.providerSessionId,
         );
   const capabilities = providerSession?.capabilities.turns;
-  if (capabilities?.supportsActiveSteering === true) {
+  if (
+    capabilities?.supportsActiveSteering === true &&
+    (deliveryIntent !== "background" || capabilities.activeSteeringInterruptsTools !== true)
+  ) {
     return { type: "steer_active", targetRunId: activeRun.id };
   }
   if (capabilities?.supportsQueuedMessages === true) {
