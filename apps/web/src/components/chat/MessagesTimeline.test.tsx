@@ -1365,7 +1365,7 @@ describe("MessagesTimeline", () => {
     });
     let entries = [workEntry(0)];
     const noop = () => {};
-    const listeners = new Map<string, () => void>();
+    const listeners = new Map<string, (event?: { deltaY: number }) => void>();
     const viewport = {
       scrollTop: 0,
       scrollHeight: 2000,
@@ -1508,15 +1508,53 @@ describe("MessagesTimeline", () => {
     }
   });
 
-  it("keeps following when a gesture interrupts a restore to the end", async () => {
+  it.each([
+    ["grow", "wheel", "frame"],
+    ["grow", "frame", "wheel"],
+    ["wheel", "grow", "frame"],
+    ["wheel", "frame", "grow"],
+    ["frame", "grow", "wheel"],
+    ["frame", "wheel", "grow"],
+  ])("reaches the end through downward input: %s, %s, %s", async (...events) => {
     const { harness, switchThread, cleanup } = await switchToRememberedThread(true);
     try {
       await switchThread();
-      act(() => harness.listeners.get("wheel")?.());
+      for (const event of events) {
+        if (event === "grow") harness.viewport.scrollHeight = 5000;
+        if (event === "frame") await harness.flushFrame();
+        if (event === "wheel") {
+          act(() => {
+            harness.listeners.get("wheel")?.({ deltaY: 40 });
+            harness.viewport.scrollTop = Math.min(
+              harness.viewport.scrollTop + 40,
+              harness.viewport.scrollHeight - harness.viewport.clientHeight,
+            );
+          });
+        }
+      }
+      for (let frame = 0; frame < 6; frame += 1) await harness.flushFrame();
 
-      // ChatView's own listeners decide whether the gesture leaves the end.
+      expect(harness.viewport.scrollTop).toBe(4200);
+      expect(harness.atEndCalls).toContain(true);
       expect(harness.manualNavigations).toBe(0);
-      expect(harness.listeners.has("wheel")).toBe(false);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("yields a saved reading position to a downward wheel before reconciliation", async () => {
+    const { harness, switchThread, cleanup } = await switchToRememberedThread(false);
+    try {
+      await switchThread();
+      act(() => {
+        harness.listeners.get("wheel")?.({ deltaY: 40 });
+        harness.viewport.scrollTop = 40;
+      });
+      for (let frame = 0; frame < 6; frame += 1) await harness.flushFrame();
+
+      expect(harness.viewport.scrollTop).toBe(40);
+      expect(harness.atEndCalls).toContain(false);
+      expect(harness.manualNavigations).toBe(1);
     } finally {
       cleanup();
     }

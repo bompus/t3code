@@ -380,10 +380,9 @@ function TimelineListFooter({ composerInset }: { readonly composerInset: number 
   );
 }
 const EMPTY_TIMELINE_SKILLS: ReadonlyArray<Pick<ServerProviderSkill, "name" | "displayName">> = [];
-// About half a second at 60 Hz. A thread still growing after this many frames
-// is handed to end maintenance instead of staying in restore with scroll
-// tracking off.
-const THREAD_RESTORE_MAX_FRAMES = 30;
+// Bound reconciliation attempts, each of which may await an estimated scroll.
+// A thread still growing then hands over to ordinary end maintenance.
+const THREAD_RESTORE_MAX_ATTEMPTS = 30;
 const TIMELINE_MAINTAIN_SCROLL_AT_END = {
   animated: false,
   on: {
@@ -441,6 +440,7 @@ interface MessagesTimelineProps {
 
   listRef: React.RefObject<LegendListRef | null>;
   timelineEntries: ReadonlyArray<TimelineEntry>;
+  onScrollNodeMount?: (node: HTMLElement) => () => void;
   latestRun: TimelineLatestRun | null;
   runningRunId?: RunId | null;
   turnDiffSummaries: ReadonlyArray<TurnDiffSummary>;
@@ -525,6 +525,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   isCompacting = false,
   listRef,
   timelineEntries,
+  onScrollNodeMount,
   latestRun,
   runningRunId = null,
   turnDiffSummaries,
@@ -840,12 +841,11 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       setPositionedThreadKey(listIdentityKey);
     };
     const savedRow = rememberedPosition?.atEnd === false ? rememberedPosition : null;
-    // A restore to the end only stops correcting on a gesture. ChatView's own
-    // listeners decide whether that gesture leaves the end, so a wheel down
-    // or a click at the bottom keeps following.
+    // End restores use ChatView's directional navigation policy. A saved
+    // reading position yields to any gesture, including a wheel toward the end.
     const cancelForNavigation = () => {
       cancelRestoration();
-      if (savedRow) onManualNavigation();
+      onManualNavigation();
     };
     const onScrollKey = (event: globalThis.KeyboardEvent) => {
       if (
@@ -857,11 +857,13 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       )
         cancelForNavigation();
     };
-    viewport?.addEventListener("wheel", cancelForNavigation, { passive: true });
-    viewport?.addEventListener("touchmove", cancelForNavigation, { passive: true });
-    viewport?.addEventListener("pointerdown", cancelForNavigation, { passive: true });
-    viewport?.ownerDocument.addEventListener("keydown", onScrollKey);
-    if (savedRow) onManualNavigation();
+    if (savedRow) {
+      viewport?.addEventListener("wheel", cancelForNavigation, { passive: true });
+      viewport?.addEventListener("touchmove", cancelForNavigation, { passive: true });
+      viewport?.addEventListener("pointerdown", cancelForNavigation, { passive: true });
+      viewport?.ownerDocument.addEventListener("keydown", onScrollKey);
+      onManualNavigation();
+    }
     if (cancelPositionRestoreRef) cancelPositionRestoreRef.current = cancelRestoration;
     const scrolling = savedRow
       ? restoreRowIndex >= 0
@@ -883,12 +885,12 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       // short once real rows measure. Keep correcting toward the target (the
       // saved row, or the end) until it and the DOM agree for two frames.
       let stableFrames = 0;
-      let frames = 0;
+      let attempts = 0;
       const reconcile = () => {
         if (cancelled) return;
         const element = list.getScrollableNode();
         const endOffset = element ? Math.max(0, element.scrollHeight - element.clientHeight) : 0;
-        if (++frames > THREAD_RESTORE_MAX_FRAMES) {
+        if (++attempts > THREAD_RESTORE_MAX_ATTEMPTS) {
           // End maintenance only re-pins within a viewport of the end, so
           // hand over from the current end rather than wherever this stopped.
           if (!savedRow && element)
@@ -1308,9 +1310,16 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   const setTimelineList = useCallback(
     (list: LegendListRef | null) => {
       listRef.current = list;
-      registerTimeline?.(list?.getScrollableNode() ?? null);
+      const node = list?.getScrollableNode() ?? null;
+      registerTimeline?.(node);
+      const removeListeners = node ? onScrollNodeMount?.(node) : undefined;
+      return () => {
+        removeListeners?.();
+        listRef.current = null;
+        registerTimeline?.(null);
+      };
     },
-    [listRef, registerTimeline],
+    [listRef, onScrollNodeMount, registerTimeline],
   );
 
   // Stable renderItem — no closure deps. Row components read shared state
