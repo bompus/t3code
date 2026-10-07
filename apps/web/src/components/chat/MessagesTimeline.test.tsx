@@ -23,12 +23,13 @@ import { create, type ReactTestRenderer } from "react-test-renderer";
 import { shouldUseRestingComposerLayout } from "../composerFooterLayout";
 import { useComposerFocusState } from "./useComposerFocusState";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vite-plus/test";
-import type { LegendListRef } from "@legendapp/list/react";
+import type { LegendListRef, MaintainVisibleContentPositionConfig } from "@legendapp/list/react";
 
 const activityTestState = vi.hoisted(() => ({
   expanded: false,
   expandedRuns: false,
   subagentTooltips: false,
+  nativeList: false,
 }));
 
 // Expose tooltip contents in the renderer without requiring a browser portal.
@@ -82,25 +83,27 @@ vi.mock("./MessagesTimeline.logic", async (importOriginal) => {
 });
 
 beforeEach(() => {
+  activityTestState.nativeList = false;
   activityTestState.subagentTooltips = false;
   activityTestState.expanded = false;
   activityTestState.expandedRuns = false;
 });
 
-vi.mock("@legendapp/list/react", async () => {
+vi.mock("@legendapp/list/react", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@legendapp/list/react")>();
   const legendListTestId = "legend-list";
 
   const LegendList = (props: {
     data: Array<{ id: string }>;
     keyExtractor: (item: { id: string }) => string;
     renderItem: (args: { item: { id: string } }) => ReactNode;
-    ListHeaderComponent?: ReactNode;
-    ListFooterComponent?: ReactNode;
+    ListHeaderComponent?: ReactElement | null;
+    ListFooterComponent?: ReactElement | null;
     anchoredEndSpace?: {
       anchorIndex: number;
       anchorMaxSize?: number;
       anchorOffset?: number;
-      onReady?: (info: { anchorIndex: number }) => void;
+      onReady?: (info: { anchorIndex: number | undefined }) => void;
       onSizeChanged?: (size: number) => void;
     };
     maintainScrollAtEnd?:
@@ -113,17 +116,12 @@ vi.mock("@legendapp/list/react", async () => {
             layout?: boolean;
           };
         };
-    maintainVisibleContentPosition?:
-      | boolean
-      | {
-          data?: boolean;
-          size?: boolean;
-          shouldRestorePosition?: boolean;
-        };
+    maintainVisibleContentPosition?: boolean | MaintainVisibleContentPositionConfig<{ id: string }>;
     className?: string;
     contentInsetEndAdjustment?: number;
     ref?: Ref<LegendListRef>;
   }) => {
+    if (activityTestState.nativeList) return <actual.LegendList {...props} />;
     if (props.anchoredEndSpace) {
       props.anchoredEndSpace.onSizeChanged?.(240);
       props.anchoredEndSpace.onReady?.({ anchorIndex: props.anchoredEndSpace.anchorIndex });
@@ -2715,6 +2713,197 @@ describe("MessagesTimeline", () => {
       ).toHaveLength(0);
     } finally {
       await act(() => renderer?.unmount());
+    }
+  });
+});
+
+describe("thread entry with the real virtualizer", () => {
+  it("returns a previously scrolled thread to its measured end", async () => {
+    vi.unstubAllGlobals();
+    vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+    activityTestState.nativeList = true;
+    vi.useFakeTimers();
+    const frames = new Map<number, FrameRequestCallback>();
+    let frameId = 0;
+    vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
+      frames.set(++frameId, callback);
+      return frameId;
+    });
+    vi.stubGlobal("cancelAnimationFrame", (id: number) => frames.delete(id));
+    const observers = new Set<{ callback: ResizeObserverCallback; elements: Set<Element> }>();
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        elements = new Set<Element>();
+        constructor(readonly callback: ResizeObserverCallback) {
+          observers.add(this);
+        }
+        observe(element: Element) {
+          this.elements.add(element);
+        }
+        unobserve(element: Element) {
+          this.elements.delete(element);
+        }
+        disconnect() {
+          this.elements.clear();
+          observers.delete(this);
+        }
+      },
+    );
+    // jsdom supplies no layout. Give the real virtualizer a 600px viewport
+    // and 180px message rows, twice its 90px estimate.
+    let lastRowHeight = 180;
+    const rectSpy = vi
+      .spyOn(HTMLElement.prototype, "getBoundingClientRect")
+      .mockImplementation(function (this: HTMLElement) {
+        const height = this.classList.contains("messages-timeline-scroll")
+          ? 600
+          : this.firstElementChild?.classList.contains("messages-timeline-row-frame")
+            ? this.textContent?.includes("Message 39")
+              ? lastRowHeight
+              : 180
+            : this.style.height.endsWith("px")
+              ? Number.parseFloat(this.style.height)
+              : 0;
+        return {
+          x: 0,
+          y: 0,
+          top: 0,
+          left: 0,
+          right: 800,
+          bottom: height,
+          width: 800,
+          height,
+          toJSON() {},
+        };
+      });
+    const heightSpy = vi
+      .spyOn(HTMLElement.prototype, "clientHeight", "get")
+      .mockImplementation(function (this: HTMLElement) {
+        return this.classList.contains("messages-timeline-scroll") ? 600 : 0;
+      });
+    const widthSpy = vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockReturnValue(800);
+    const scrollHeightSpy = vi
+      .spyOn(HTMLElement.prototype, "scrollHeight", "get")
+      .mockImplementation(function (this: HTMLElement) {
+        return Math.max(
+          600,
+          ...Array.from(this.querySelectorAll<HTMLElement>("div")).map((node) =>
+            node.style.height.endsWith("px") ? Number.parseFloat(node.style.height) : 0,
+          ),
+        );
+      });
+    const originalScrollTo = HTMLElement.prototype.scrollTo;
+    HTMLElement.prototype.scrollTo = function (
+      this: HTMLElement,
+      options?: ScrollToOptions | number,
+      y?: number,
+    ) {
+      this.scrollTop = typeof options === "number" ? (y ?? 0) : (options?.top ?? this.scrollTop);
+      this.dispatchEvent(new Event("scroll"));
+    };
+    const flushLayout = async () => {
+      for (let i = 0; i < 12; i++) {
+        await act(async () => {
+          for (const observer of observers) {
+            observer.callback(
+              Array.from(observer.elements).map(
+                (target) =>
+                  ({
+                    target,
+                    contentRect: target.getBoundingClientRect(),
+                  }) as ResizeObserverEntry,
+              ),
+              observer as unknown as ResizeObserver,
+            );
+          }
+        });
+        await act(async () => {
+          const callbacks = [...frames.values()];
+          frames.clear();
+          callbacks.forEach((callback) => callback(i * 16));
+          vi.advanceTimersByTime(16);
+        });
+      }
+    };
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    const props = buildProps();
+    const entries = Array.from({ length: 40 }, (_, index) => {
+      const entry = buildUserTimelineEntry(`Message ${index}`);
+      return {
+        ...entry,
+        id: `entry-${index}`,
+        message: { ...entry.message, id: MessageId.make(`message-${index}`) },
+      };
+    });
+    const renderThread = async (key: string, displayThreadKey = key) => {
+      await act(async () =>
+        root.render(
+          <MessagesTimeline
+            {...props}
+            routeThreadKey={displayThreadKey}
+            displayThreadKey={displayThreadKey}
+            entryThreadKey={key}
+            timelineEntries={entries}
+          />,
+        ),
+      );
+      await flushLayout();
+    };
+    try {
+      await renderThread("entry-test:thread-a");
+      const firstViewport = props.listRef.current!.getScrollableNode();
+      expect(firstViewport.scrollTop).toBeGreaterThan(3000);
+      await act(async () => {
+        firstViewport.scrollTop = 100;
+        firstViewport.dispatchEvent(new Event("scroll"));
+      });
+      // B has no cached history yet, so the client keeps A visible while B loads.
+      await renderThread("entry-test:thread-b", "entry-test:thread-a");
+      await renderThread("entry-test:thread-a");
+      const viewport = props.listRef.current!.getScrollableNode();
+      expect(viewport.scrollTop).toBeGreaterThan(3000);
+      expect(
+        Math.abs(viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop),
+      ).toBeLessThanOrEqual(1);
+      expect(container.textContent).toContain("Message 39");
+      lastRowHeight = 2800;
+      await flushLayout();
+      expect(
+        Math.abs(viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop),
+      ).toBeLessThanOrEqual(1);
+      expect(viewport.scrollTop).toBeGreaterThan(5600);
+      props.liveFollowEnabled = false;
+      await renderThread("entry-test:thread-a");
+      await act(async () => {
+        // Use the production cancellation path before the browser's user scroll.
+        await props.listRef.current!.scrollToItem({ item: {} as never, animated: false });
+        viewport.scrollTop = 100;
+        viewport.dispatchEvent(new Event("scroll"));
+      });
+      lastRowHeight = 4000;
+      await flushLayout();
+      expect(viewport.scrollTop).toBe(100);
+      props.liveFollowEnabled = true;
+      await renderThread("entry-test:thread-b");
+      await renderThread("entry-test:thread-a");
+      const reopened = props.listRef.current!.getScrollableNode();
+      expect(
+        Math.abs(reopened.scrollHeight - reopened.clientHeight - reopened.scrollTop),
+      ).toBeLessThanOrEqual(1);
+    } finally {
+      await act(async () => root.unmount());
+      container.remove();
+      rectSpy.mockRestore();
+      heightSpy.mockRestore();
+      widthSpy.mockRestore();
+      scrollHeightSpy.mockRestore();
+      HTMLElement.prototype.scrollTo = originalScrollTo;
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+      activityTestState.nativeList = false;
     }
   });
 });

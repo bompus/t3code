@@ -142,34 +142,31 @@ export function getAnchoredTurnMetrics({
   };
 }
 
-export interface RememberedTimelinePosition {
-  readonly rowId: string;
-  readonly offsetWithinRow: number;
-  readonly scrollOffset: number;
-  readonly atEnd: boolean;
-  readonly disclosures?: {
-    readonly runs: ReadonlySet<RunId>;
-    readonly workGroups: ReadonlySet<string>;
-    readonly attempts: ReadonlySet<RunAttemptId>;
-    readonly workGroupState: {
-      scrollPositions: Map<string, { readonly entryId: string; readonly offset: number }>;
-      expandedEntries: Set<string>;
-    };
+export interface RememberedTimelineDisclosures {
+  readonly runs: ReadonlySet<RunId>;
+  readonly workGroups: ReadonlySet<string>;
+  readonly attempts: ReadonlySet<RunAttemptId>;
+  readonly workGroupState: {
+    scrollPositions: Map<string, { readonly entryId: string; readonly offset: number }>;
+    expandedEntries: Set<string>;
   };
 }
 
 // Scoped thread keys keep separate environments independent. Bound the session cache.
-const rememberedTimelinePositions = new Map<string, RememberedTimelinePosition>();
+const rememberedTimelineDisclosures = new Map<string, RememberedTimelineDisclosures>();
 
-export function readTimelinePosition(threadKey: string) {
-  return rememberedTimelinePositions.get(threadKey);
+export function readTimelineDisclosures(threadKey: string) {
+  return rememberedTimelineDisclosures.get(threadKey);
 }
 
-export function rememberTimelinePosition(threadKey: string, position: RememberedTimelinePosition) {
-  rememberedTimelinePositions.delete(threadKey);
-  rememberedTimelinePositions.set(threadKey, position);
-  if (rememberedTimelinePositions.size > 100) {
-    const oldest = rememberedTimelinePositions.keys().next().value;
-    if (oldest !== undefined) rememberedTimelinePositions.delete(oldest);
+export function rememberTimelineDisclosures(
+  threadKey: string,
+  disclosures: RememberedTimelineDisclosures,
+) {
+  rememberedTimelineDisclosures.delete(threadKey);
+  rememberedTimelineDisclosures.set(threadKey, disclosures);
+  if (rememberedTimelineDisclosures.size > 100) {
+    const oldest = rememberedTimelineDisclosures.keys().next().value;
+    if (oldest !== undefined) rememberedTimelineDisclosures.delete(oldest);
   }
 }
