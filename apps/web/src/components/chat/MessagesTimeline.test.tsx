@@ -2717,6 +2717,64 @@ describe("MessagesTimeline", () => {
   });
 });
 
+describe("disclosure state across thread switches", () => {
+  it("remembers an expanded turn without waiting for a scroll or animation frame", async () => {
+    vi.unstubAllGlobals();
+    vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+    vi.stubGlobal("requestAnimationFrame", () => 1);
+    vi.stubGlobal("cancelAnimationFrame", () => {});
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        unobserve() {}
+        disconnect() {}
+      },
+    );
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    const runId = RunId.make("disclosure-switch-run");
+    const entries = ["Earlier response", "Final response"].map((text, index) => {
+      const entry = buildAssistantTimelineEntry(text);
+      return {
+        ...entry,
+        id: `disclosure-switch-entry-${index}`,
+        message: { ...entry.message, id: MessageId.make(`disclosure-switch-${index}`), runId },
+      };
+    });
+    const renderThread = async (threadKey: string) => {
+      await act(async () => {
+        root.render(
+          <MessagesTimeline
+            {...buildProps()}
+            routeThreadKey={threadKey}
+            timelineEntries={entries}
+          />,
+        );
+      });
+    };
+    try {
+      await renderThread("disclosure-switch:thread-a");
+      expect(container.textContent).not.toContain("Earlier response");
+      const toggle = container.querySelector<HTMLButtonElement>(
+        '[data-timeline-row-kind="turn-fold"] button',
+      );
+      expect(toggle).not.toBeNull();
+      await act(async () => toggle!.click());
+      expect(container.textContent).toContain("Earlier response");
+      await renderThread("disclosure-switch:thread-b");
+      expect(container.textContent).not.toContain("Earlier response");
+      await renderThread("disclosure-switch:thread-a");
+      expect(container.textContent).toContain("Earlier response");
+    } finally {
+      await act(async () => root.unmount());
+      container.remove();
+      vi.unstubAllGlobals();
+    }
+  });
+});
+
 describe("thread entry with the real virtualizer", () => {
   it("returns a previously scrolled thread to its measured end", async () => {
     vi.unstubAllGlobals();

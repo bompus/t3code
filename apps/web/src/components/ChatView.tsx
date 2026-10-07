@@ -6395,13 +6395,6 @@ export default function ChatView(props: ChatViewProps) {
       }
     }
   }, []);
-  const cancelTimelineLiveFollowForUserNavigationRef = useRef(
-    cancelTimelineLiveFollowForUserNavigation,
-  );
-  useEffect(() => {
-    cancelTimelineLiveFollowForUserNavigationRef.current =
-      cancelTimelineLiveFollowForUserNavigation;
-  }, [cancelTimelineLiveFollowForUserNavigation]);
   useEffect(() => {
     const previous = observedTimelineActivityRef.current;
     const dispatchedUserItem =
@@ -6502,7 +6495,7 @@ export default function ChatView(props: ChatViewProps) {
   const onTimelineScrollNodeMount = useCallback(
     (scrollNode: HTMLElement) => {
       const handleManualNavigation = () => {
-        cancelTimelineLiveFollowForUserNavigationRef.current();
+        cancelTimelineLiveFollowForUserNavigation();
       };
       // The gestures below must only break follow when they can actually
       // move the viewport away from the live edge (#5566): a spurious break
@@ -6630,7 +6623,11 @@ export default function ChatView(props: ChatViewProps) {
         document.removeEventListener("keydown", handleKeyDown);
       };
     },
-    [isTimelineAtLogicalEnd, timelineRealContentOverflowsViewport],
+    [
+      cancelTimelineLiveFollowForUserNavigation,
+      isTimelineAtLogicalEnd,
+      timelineRealContentOverflowsViewport,
+    ],
   );
 
   const onTimelineAnchorReady = useCallback((messageId: MessageId, anchorIndex: number) => {

@@ -628,7 +628,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   const expandCitedRun = useCallback((runId: RunId) => {
     setExpandedRunIds((current) => (current.has(runId) ? current : new Set([...current, runId])));
   }, []);
-  // Nested tool state shares the bounded thread-position cache.
+  // Nested tool state shares the bounded disclosure cache.
   const workGroupViewState = useMemo<WorkGroupViewState>(
     () =>
       rememberedDisclosures?.workGroupState ?? {
@@ -948,12 +948,6 @@ export const MessagesTimeline = memo(function MessagesTimeline({
     const state = listRef.current?.getState?.();
     if (state?.data !== rows) return;
     const isAtEnd = resolveTimelineIsAtEnd(state);
-    rememberTimelineDisclosures(listIdentityKey, {
-      runs: paintedExpandedRunIds,
-      workGroups: paintedExpandedWorkGroupIds,
-      attempts: paintedExpandedAttemptIds,
-      workGroupState: workGroupViewState,
-    });
     if (isAtEnd !== undefined && !citationPositioning) {
       onIsAtEndChange(isAtEnd);
     }
@@ -997,12 +991,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
     );
   }, [
     citationPositioning,
-    paintedExpandedRunIds,
-    paintedExpandedWorkGroupIds,
-    paintedExpandedAttemptIds,
-    workGroupViewState,
     rows,
-    listIdentityKey,
     listRef,
     minimapItems,
     minimapStripMap,
@@ -1011,9 +1000,23 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   ]);
 
   useEffect(() => {
+    rememberTimelineDisclosures(listIdentityKey, {
+      runs: paintedExpandedRunIds,
+      workGroups: paintedExpandedWorkGroupIds,
+      attempts: paintedExpandedAttemptIds,
+      workGroupState: workGroupViewState,
+    });
     const frame = requestAnimationFrame(handleScroll);
     return () => cancelAnimationFrame(frame);
-  }, [handleScroll, rows.length]);
+  }, [
+    handleScroll,
+    listIdentityKey,
+    paintedExpandedRunIds,
+    paintedExpandedWorkGroupIds,
+    paintedExpandedAttemptIds,
+    workGroupViewState,
+    rows.length,
+  ]);
 
   useEffect(() => {
     if (!timelineViewportElement) {
