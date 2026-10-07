@@ -452,7 +452,10 @@ export const make = Effect.gen(function* () {
       SubscriptionRef.changes(entries),
     ).pipe(
       Stream.map((current) => Option.fromUndefinedOr(current.get(environmentId))),
-      Stream.changes,
+      // Re-pairing can replace the supervisor while its catalog details stay unchanged.
+      Stream.changesWith(
+        (previous, current) => Option.getOrNull(previous) === Option.getOrNull(current),
+      ),
       Stream.switchMap(
         Option.match({
           onNone: () => Stream.empty,
@@ -482,7 +485,7 @@ export const make = Effect.gen(function* () {
       persistedRoutesByEnvironment.keys(),
       (environmentId) =>
         acquireSupervisor(environmentId).pipe(
-          Effect.catchTag("EnvironmentNotRegisteredError", () => Effect.void),
+          Effect.catchTags({ EnvironmentNotRegisteredError: () => Effect.void }),
         ),
       {
         concurrency: "unbounded",
@@ -999,7 +1002,7 @@ export const make = Effect.gen(function* () {
         relayEnvironmentIds,
         (environmentId) =>
           removeRoute(environmentId, RELAY_ROUTE_ID).pipe(
-            Effect.catchTag("EnvironmentNotRegisteredError", () => Effect.void),
+            Effect.catchTags({ EnvironmentNotRegisteredError: () => Effect.void }),
           ),
         {
           concurrency: "unbounded",
@@ -1012,7 +1015,7 @@ export const make = Effect.gen(function* () {
   const retryNow = (environmentId: EnvironmentId) =>
     acquireSupervisor(environmentId).pipe(
       Effect.flatMap((supervisor) => supervisor.retryNow),
-      Effect.catchTag("EnvironmentNotRegisteredError", () => Effect.void),
+      Effect.catchTags({ EnvironmentNotRegisteredError: () => Effect.void }),
       Effect.withSpan("EnvironmentRegistry.retryNow"),
     );
   const setEnabled = Effect.fn("EnvironmentRegistry.setEnabled")(function* (
