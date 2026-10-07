@@ -192,6 +192,7 @@ import {
   OrchestrationGetWorkflowScriptError,
   OrchestrationV2DispatchCommandError,
   OrchestrationV2GetShellSnapshotError,
+  OrchestrationV2GetCommandOutcomeError,
   OrchestrationV2GetThreadProjectionError,
   OrchestrationV2RpcSchemas,
   OrchestrationV2ThreadLaunchError,
@@ -1532,6 +1533,15 @@ const WsOrchestrationV2GetArchivedShellSnapshotRpc = Rpc.make(
   },
 );
 
+const WsOrchestrationV2GetCommandOutcomeRpc = Rpc.make(
+  ORCHESTRATION_V2_WS_METHODS.getCommandOutcome,
+  {
+    payload: OrchestrationV2RpcSchemas.getCommandOutcome.input,
+    success: OrchestrationV2RpcSchemas.getCommandOutcome.output,
+    error: Schema.Union([OrchestrationV2GetCommandOutcomeError, EnvironmentAuthorizationError]),
+  },
+);
+
 const WsOrchestrationV2GetThreadProjectionRpc = Rpc.make(
   ORCHESTRATION_V2_WS_METHODS.getThreadProjection,
   {
@@ -1906,6 +1916,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsOrchestrationV2SearchThreadsRpc,
   WsOrchestrationV2GetArchivedShellSnapshotRpc,
   WsOrchestrationV2GetThreadProjectionRpc,
+  WsOrchestrationV2GetCommandOutcomeRpc,
   WsOrchestrationV2LaunchThreadRpc,
   WsOrchestrationV2SubscribeArchivedShellRpc,
   WsOrchestrationV2SubscribeShellRpc,

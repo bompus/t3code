@@ -2,8 +2,16 @@ import { describe, expect, it } from "vite-plus/test";
 import * as Exit from "effect/Exit";
 import * as Schema from "effect/Schema";
 
-import { ORCHESTRATION_V2_WS_METHODS } from "./orchestrationV2.ts";
+import {
+  ORCHESTRATION_V2_WS_METHODS,
+  OrchestrationV2GetCommandOutcomeResult,
+} from "./orchestrationV2.ts";
 import { WsRpcGroup, WsSubscribeServerConfigRpc } from "./rpc.ts";
+
+const commandOutcomeRpc = WsRpcGroup.requests.get(ORCHESTRATION_V2_WS_METHODS.getCommandOutcome);
+if (commandOutcomeRpc === undefined) throw new Error("getCommandOutcome is not registered");
+const decodeCommandOutcome = Schema.decodeExit(OrchestrationV2GetCommandOutcomeResult);
+const decodeCommandOutcomeInput = Schema.decodeExit(commandOutcomeRpc.payloadSchema);
 
 /**
  * The client always sends `environmentThemes`, including to servers built
@@ -66,5 +74,41 @@ describe("WebSocket RPC contracts", () => {
         }),
       ),
     ).toBe(true);
+  });
+});
+
+describe("command outcome lookup contract", () => {
+  it("rejects leaked receipt fields and definitive rejection admission claims", () => {
+    const identity = { threadId: "thread:lookup", commandId: "command:lookup" };
+    const accepted = { ...identity, state: "accepted", commandType: "message.dispatch" };
+    const rejected = {
+      ...identity,
+      state: "rejected",
+      commandType: "message.dispatch",
+      admission: "unknown",
+    };
+    for (const valid of [
+      accepted,
+      rejected,
+      { ...identity, state: "unknown", reason: "not_found" },
+    ]) {
+      expect(Exit.isSuccess(decodeCommandOutcome(valid))).toBe(true);
+      expect(Exit.isFailure(decodeCommandOutcome({ ...valid, error: "private" }))).toBe(true);
+    }
+    expect(Exit.isFailure(decodeCommandOutcome({ ...rejected, admission: "not_admitted" }))).toBe(
+      true,
+    );
+    expect(Exit.isFailure(decodeCommandOutcome({ ...rejected, admission: undefined }))).toBe(true);
+  });
+  it("rejects payload fields that attempt to widen the read", () => {
+    const input = { threadId: "thread:lookup", commandId: "command:lookup" };
+    expect(Exit.isSuccess(decodeCommandOutcomeInput(input))).toBe(true);
+    for (const invalid of [
+      { ...input, include: "error" },
+      { threadId: input.threadId },
+      { ...input, commandId: "" },
+    ]) {
+      expect(Exit.isFailure(decodeCommandOutcomeInput(invalid))).toBe(true);
+    }
   });
 });

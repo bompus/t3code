@@ -1,4 +1,11 @@
-import { CommandId, NonNegativeInt, ProjectId, ThreadId } from "@t3tools/contracts";
+import {
+  CommandId,
+  NonNegativeInt,
+  ProjectId,
+  ThreadId,
+  type OrchestrationV2GetCommandOutcomeInput,
+  type OrchestrationV2GetCommandOutcomeResult,
+} from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -72,6 +79,9 @@ export type ProjectCommandReceiptV2 = typeof ProjectCommandReceiptV2.Type;
 type AnyCommandReceiptV2 = CommandReceiptV2 | ProjectCommandReceiptV2;
 
 export interface CommandReceiptStoreV2Shape {
+  readonly getOutcome: (
+    input: OrchestrationV2GetCommandOutcomeInput,
+  ) => Effect.Effect<OrchestrationV2GetCommandOutcomeResult, CommandReceiptStoreReadError>;
   readonly insertIfAbsent: (
     receipt: AnyCommandReceiptV2,
   ) => Effect.Effect<boolean, CommandReceiptStoreV2Error>;
@@ -146,7 +156,45 @@ const layerBase: Layer.Layer<
   Effect.gen(function* () {
     const receipts = yield* OrchestrationCommandReceipts.OrchestrationCommandReceiptRepository;
 
+    const getOutcome = Effect.fn("CommandReceiptStoreV2.getOutcome")(function* (
+      input: OrchestrationV2GetCommandOutcomeInput,
+    ): Effect.fn.Return<OrchestrationV2GetCommandOutcomeResult, CommandReceiptStoreReadError> {
+      const found = yield* receipts
+        .getByCommandId({ commandId: input.commandId })
+        .pipe(
+          Effect.mapError(
+            (cause) => new CommandReceiptStoreReadError({ commandId: input.commandId, cause }),
+          ),
+        );
+      if (
+        Option.isNone(found) ||
+        found.value.aggregateKind !== "thread" ||
+        found.value.aggregateId !== input.threadId
+      ) {
+        return {
+          state: "unknown",
+          threadId: input.threadId,
+          commandId: input.commandId,
+          reason: "not_found",
+        };
+      }
+      const receipt = yield* fromApplicationReceipt(found.value).pipe(
+        Effect.mapError(
+          (cause) => new CommandReceiptStoreReadError({ commandId: input.commandId, cause }),
+        ),
+      );
+      const identity = {
+        threadId: input.threadId,
+        commandId: input.commandId,
+        commandType: receipt.commandType,
+      };
+      return receipt.status === "accepted"
+        ? { ...identity, state: "accepted" }
+        : { ...identity, state: "rejected", admission: "unknown" };
+    });
+
     return CommandReceiptStoreV2.of({
+      getOutcome,
       insertIfAbsent: (receipt) =>
         receipts.insertIfAbsent(toApplicationReceipt(receipt)).pipe(
           Effect.mapError(

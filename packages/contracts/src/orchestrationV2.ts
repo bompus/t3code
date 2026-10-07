@@ -3139,6 +3139,7 @@ export const ORCHESTRATION_V2_WS_METHODS = {
   searchThreads: "orchestration.searchThreads",
   getArchivedShellSnapshot: "orchestration.getArchivedShellSnapshot",
   getThreadProjection: "orchestration.getThreadProjection",
+  getCommandOutcome: "orchestration.getCommandOutcome",
   getWorkflowScript: "orchestration.getWorkflowScript",
   getTurnItem: "orchestration.getTurnItem",
   launchThread: "orchestration.launchThread",
@@ -3208,6 +3209,54 @@ export const OrchestrationV2DispatchCommandResult = Schema.Struct({
   sequence: NonNegativeInt,
 });
 export type OrchestrationV2DispatchCommandResult = typeof OrchestrationV2DispatchCommandResult.Type;
+
+// Check names before Struct decoding can strip unknown properties.
+const commandOutcomeStruct = <const Fields extends Schema.Struct.Fields>(fields: Fields) =>
+  Schema.Record(Schema.String, Schema.Unknown)
+    .check(Schema.isPropertyNames(Schema.Literals(Object.keys(fields))))
+    .pipe(Schema.decodeTo(Schema.Struct(fields)));
+
+export const OrchestrationV2GetCommandOutcomeInput = commandOutcomeStruct({
+  threadId: ThreadId,
+  commandId: CommandId,
+});
+export type OrchestrationV2GetCommandOutcomeInput =
+  typeof OrchestrationV2GetCommandOutcomeInput.Type;
+
+/** Accepted receipts confirm admission, not provider completion. Missing receipts cannot justify retry. */
+export const OrchestrationV2GetCommandOutcomeResult = Schema.Union([
+  commandOutcomeStruct({
+    state: Schema.Literal("accepted"),
+    threadId: ThreadId,
+    commandId: CommandId,
+    commandType: Schema.String,
+  }),
+  commandOutcomeStruct({
+    state: Schema.Literal("rejected"),
+    threadId: ThreadId,
+    commandId: CommandId,
+    commandType: Schema.String,
+    // Historical rejection records do not prove that no side effects occurred.
+    admission: Schema.Literal("unknown"),
+  }),
+  commandOutcomeStruct({
+    state: Schema.Literal("unknown"),
+    threadId: ThreadId,
+    commandId: CommandId,
+    reason: Schema.Literal("not_found"),
+  }),
+]);
+export type OrchestrationV2GetCommandOutcomeResult =
+  typeof OrchestrationV2GetCommandOutcomeResult.Type;
+
+export class OrchestrationV2GetCommandOutcomeError extends Schema.TaggedError<OrchestrationV2GetCommandOutcomeError>()(
+  "OrchestrationV2GetCommandOutcomeError",
+  { threadId: ThreadId, commandId: CommandId },
+) {
+  override get message(): string {
+    return "Failed to read command outcome.";
+  }
+}
 
 export const OrchestrationV2GetThreadProjectionInput = Schema.Struct({
   threadId: ThreadId,
@@ -3413,6 +3462,7 @@ export class OrchestrationV2ThreadLaunchError extends Schema.TaggedError<Orchest
 ) {}
 
 export const OrchestrationV2RpcError = Schema.Union([
+  OrchestrationV2GetCommandOutcomeError,
   OrchestrationV2DispatchCommandError,
   OrchestrationV2GetThreadProjectionError,
   OrchestrationV2GetShellSnapshotError,
@@ -3485,6 +3535,10 @@ export class OrchestrationGetWorkflowScriptError extends Schema.TaggedError<Orch
 }
 
 export const OrchestrationV2RpcSchemas = {
+  getCommandOutcome: {
+    input: OrchestrationV2GetCommandOutcomeInput,
+    output: OrchestrationV2GetCommandOutcomeResult,
+  },
   dispatchCommand: {
     input: OrchestrationV2Command,
     output: OrchestrationV2DispatchCommandResult,
