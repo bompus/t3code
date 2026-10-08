@@ -9,7 +9,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from
 
 import * as ServerBrowserPage from "./ServerBrowserPage.ts";
 
-describe("server browser element refs", () => {
+describe("server browser page operations", () => {
   let browser: Browser;
   let context: BrowserContext;
   let page: Page;
@@ -39,6 +39,101 @@ describe("server browser element refs", () => {
       networkEntries: [],
       actionTimeline: [],
     });
+  it("reads rendered content with warnings, links and structure without changing the DOM", async () => {
+    await page.setContent(`
+      <base href="https://example.com/docs/">
+      <title>Reader fixture</title><nav>Outer navigation</nav>
+      <main><h1>Rendered documentation</h1>
+        <nav>Inner navigation</nav><aside>Warning: preserve this instruction.</aside>
+        <p><a href="guide">Read the guide</a></p><img src="diagram.png">
+        <table><tr><th>Feature</th><th>State</th></tr><tr><td>Reader</td><td>Optional</td></tr></table>
+        <pre><code class="language-js">const answer = 42;</code></pre>
+        <ul><li>First item</li></ul><details><summary>More</summary>Collapsed explanation</details>
+        <p hidden>Hidden draft</p><p style="display:none">CSS hidden draft</p>
+        <div style="content-visibility:hidden">Unrendered hidden draft</div>
+        <div style="visibility:hidden">Invisible draft<aside style="visibility:visible">Visible warning</aside></div>
+        <input value="private-input"><textarea>private-textarea</textarea>
+        <select><option>private-selection</option></select>
+        <x-reader>Custom block text</x-reader><div id="dynamic"></div><footer>Footer links</footer>
+      </main>
+      <script>
+        window.upgrades = 0;
+        customElements.define('x-reader', class extends HTMLElement {
+          constructor() { super(); window.upgrades++; }
+        });
+        document.querySelector('#dynamic').textContent = 'Loaded JavaScript content';
+      </script>`);
+    const original = await page.content();
+    const result = await ServerBrowserPage.read(page, {});
+    expect(result.title).toBe("Reader fixture");
+    expect(result.scope).toBe("main");
+    expect(result.truncated).toBe(false);
+    for (const text of [
+      "# Rendered documentation",
+      "Warning: preserve this instruction.",
+      "Visible warning",
+      "[Read the guide](https://example.com/docs/guide)",
+      "https://example.com/docs/diagram.png",
+      "| Feature | State |",
+      "const answer = 42;",
+      "First item",
+      "Collapsed explanation",
+      "Custom block text",
+      "Loaded JavaScript content",
+    ])
+      expect(result.markdown).toContain(text);
+    for (const text of [
+      "navigation",
+      "Hidden draft",
+      "CSS hidden draft",
+      "Unrendered hidden draft",
+      "Invisible draft",
+      "private-",
+      "Footer links",
+    ])
+      expect(result.markdown).not.toContain(text);
+    expect(result.warnings.join(" ")).toContain("shadow DOM");
+    expect(await page.content()).toBe(original);
+    expect(await page.evaluate("window.upgrades")).toBe(1);
+  });
+
+  it("selects an exact content root and rejects missing, ambiguous or invalid selectors", async () => {
+    await page.setContent(
+      "<article><h1>Article fallback</h1></article><section>One</section><section>Two</section>",
+    );
+    expect((await ServerBrowserPage.read(page, {})).scope).toBe("article");
+    expect(
+      (await ServerBrowserPage.read(page, { selector: "section:first-of-type" })).markdown,
+    ).toBe("One");
+    for (const selector of ["#missing", "section", "["])
+      await expect(ServerBrowserPage.read(page, { selector })).rejects.toThrow();
+    await page.setContent("<p>Body fallback</p>");
+    expect((await ServerBrowserPage.read(page, {})).scope).toBe("body");
+    await page.setContent(
+      '<div style="content-visibility:hidden"><article>Hidden selected root</article></div>',
+    );
+    expect((await ServerBrowserPage.read(page, { selector: "article" })).markdown).toBe("");
+  });
+
+  it("bounds UTF-8 and escaped JSON output without splitting Unicode", async () => {
+    await page.setContent(`<main><p>${'😀\\"'.repeat(15_000)}</p></main>`);
+    const small = await ServerBrowserPage.read(page, { maxBytes: 513 });
+    expect(Buffer.byteLength(small.markdown, "utf8")).toBeLessThanOrEqual(513);
+    expect(small.markdown).not.toContain("\uFFFD");
+    expect(small.truncated).toBe(true);
+    expect(small.warnings.join(" ")).toContain("truncated");
+    const large = await ServerBrowserPage.read(page, { maxBytes: 40_000 });
+    expect(Buffer.byteLength(JSON.stringify(large), "utf8")).toBeLessThanOrEqual(60_000);
+    expect(large.truncated).toBe(true);
+  });
+
+  it("rejects oversized HTML before conversion and permits a smaller selected section", async () => {
+    await page.setContent(`<main>${"x".repeat(1_000_000)}</main><article>Small section</article>`);
+    await expect(ServerBrowserPage.read(page, {})).rejects.toThrow("input limit");
+    expect((await ServerBrowserPage.read(page, { selector: "article" })).markdown).toBe(
+      "Small section",
+    );
+  });
   const locators = (tree: unknown) => {
     expect(typeof tree).toBe("string");
     return Array.from(

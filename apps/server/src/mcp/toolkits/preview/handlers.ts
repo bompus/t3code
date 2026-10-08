@@ -16,6 +16,7 @@ import {
   type PreviewAutomationSelectResult,
   type PreviewAutomationSetColorSchemeResult,
   type PreviewAutomationSnapshot,
+  type PreviewAutomationReadResult,
   type PreviewAutomationStatus,
   type PreviewTabId,
 } from "@t3tools/contracts";
@@ -75,7 +76,7 @@ const invoke = Effect.fn("PreviewToolkit.invoke")(function* <A>(
     ...(timeoutMs === undefined ? {} : { timeoutMs }),
     ...(tabId === undefined ? {} : { tabId }),
   });
-  if (["status", "open", "navigate", "snapshot"].includes(operation)) return { result };
+  if (["status", "open", "navigate", "snapshot", "read"].includes(operation)) return { result };
   const statusTabId =
     (operation !== "evaluate" && typeof result === "object" && result !== null
       ? (result as { tabId?: PreviewTabId }).tabId
@@ -213,6 +214,9 @@ const handlers = {
     const { includeImage: _includeImage, save: _save, ...operationInput } = input ?? {};
     return invokeTargeted<PreviewAutomationSnapshot>("snapshot", operationInput);
   }),
+  preview_read: McpToolAccess.readsAsCaller((input) =>
+    invokeTargeted<PreviewAutomationReadResult>("read", input),
+  ),
   preview_click: McpToolAccess.actsAsCaller((input) =>
     invokeTargeted<object>("click", input, input.timeoutMs),
   ),

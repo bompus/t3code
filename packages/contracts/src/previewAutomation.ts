@@ -43,6 +43,7 @@ const PREVIEW_AUTOMATION_OPERATIONS = [
   ...PREVIEW_AUTOMATION_V1_OPERATIONS,
   "resize",
   "setColorScheme",
+  "read",
 ] as const;
 
 export const PREVIEW_AUTOMATION_SERVER_OPERATIONS = [
@@ -580,6 +581,28 @@ export const PreviewAutomationScrollInput = Schema.Struct({
       "Scrolls the viewport, or a locator/selector container. Provide deltaX, deltaY, or both.",
   });
 export type PreviewAutomationScrollInput = typeof PreviewAutomationScrollInput.Type;
+
+export const PreviewAutomationReadInput = Schema.Struct({
+  ...PreviewAutomationTabTargetFields,
+  selector: Schema.optional(TrimmedNonEmptyString.check(Schema.isMaxLength(2048))).annotate({
+    description:
+      "CSS selector matching exactly one content root. Defaults to main, article, then body.",
+  }),
+  maxBytes: Schema.optional(
+    Schema.Int.check(Schema.isGreaterThanOrEqualTo(512)).check(Schema.isLessThanOrEqualTo(40_000)),
+  ).annotate({ description: "Maximum UTF-8 Markdown bytes. Defaults to 20000; maximum 40000." }),
+});
+export type PreviewAutomationReadInput = typeof PreviewAutomationReadInput.Type;
+
+export const PreviewAutomationReadResult = Schema.Struct({
+  url: Schema.String,
+  title: Schema.String,
+  scope: Schema.String,
+  markdown: Schema.String,
+  truncated: Schema.Boolean,
+  warnings: Schema.Array(Schema.String),
+});
+export type PreviewAutomationReadResult = typeof PreviewAutomationReadResult.Type;
 
 export const PreviewAutomationEvaluateInput = Schema.Struct({
   ...PreviewAutomationTabTargetFields,

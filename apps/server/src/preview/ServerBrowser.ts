@@ -13,6 +13,7 @@ import {
   type PreviewAutomationConsoleEntry,
   type PreviewAutomationDragInput,
   type PreviewAutomationEvaluateInput,
+  type PreviewAutomationReadInput,
   type PreviewAutomationHoverInput,
   type PreviewAutomationNavigateInput,
   type PreviewAutomationNetworkEntry,
@@ -1694,6 +1695,8 @@ const make = Effect.gen(function* () {
         );
       case "evaluate":
         return ServerBrowserPage.evaluate(tab.cdp, input as PreviewAutomationEvaluateInput);
+      case "read":
+        return ServerBrowserPage.read(tab.page, input as PreviewAutomationReadInput);
       case "waitFor":
         return ServerBrowserPage.waitFor(tab.page, input as PreviewAutomationWaitForInput);
       case "recordingStart": {

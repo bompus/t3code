@@ -6,6 +6,8 @@ import {
   PreviewAutomationDragInput,
   PreviewAutomationError,
   PreviewAutomationEvaluateInput,
+  PreviewAutomationReadInput,
+  PreviewAutomationReadResult,
   PreviewAutomationHoverInput,
   PreviewAutomationNavigateInput,
   PreviewAutomationOpenInput,
@@ -311,6 +313,17 @@ const PreviewRecordingStopTool = safeBrowserTool(
   }).annotate(Tool.Title, "Stop browser recording"),
 );
 
+const PreviewReadTool = readonlyBrowserTool(
+  Tool.make("preview_read", {
+    description:
+      "Read the current main-frame DOM as bounded Markdown without changing the page. Preserves links, tables, code and warning text; omits hidden content, navigation, footer and form controls. Defaults to main, article, then body; pass selector for exactly one different content root. Returns source URL, title, selected scope, warnings and truncation. Frames, shadow DOM, canvas and unloaded content are not included. Use snapshot for layout and interaction. Requires the same tab access as other preview tools.",
+    parameters: PreviewAutomationReadInput,
+    success: Schema.Struct({ ...PreviewAutomationReadResult.fields, ...presentationFields }),
+    failure: PreviewToolFailure,
+    dependencies,
+  }).annotate(Tool.Title, "Read browser page"),
+);
+
 export const PreviewToolkit = Toolkit.make(
   PreviewDialogTool,
   PreviewStatusTool,
@@ -319,6 +332,7 @@ export const PreviewToolkit = Toolkit.make(
   PreviewResizeTool,
   PreviewSetAppearanceTool,
   PreviewSnapshotTool,
+  PreviewReadTool,
   PreviewClickTool,
   PreviewTypeTool,
   PreviewHoverTool,
@@ -334,6 +348,7 @@ export const PreviewToolkit = Toolkit.make(
 );
 
 export const PreviewStandardToolkit = Toolkit.make(
+  PreviewReadTool,
   PreviewDialogTool,
   PreviewStatusTool,
   PreviewOpenTool,

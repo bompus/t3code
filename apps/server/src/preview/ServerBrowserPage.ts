@@ -6,6 +6,8 @@ import {
   type PreviewAutomationConsoleEntry,
   type PreviewAutomationDragInput,
   type PreviewAutomationEvaluateInput,
+  type PreviewAutomationReadInput,
+  type PreviewAutomationReadResult,
   type PreviewAutomationHoverInput,
   type PreviewAutomationNetworkEntry,
   type PreviewAutomationPressInput,
@@ -18,6 +20,7 @@ import {
   type PreviewAutomationWaitForInput,
 } from "@t3tools/contracts";
 import { constVoid } from "effect/Function";
+import { htmlToMarkdown } from "@mdream/js";
 import type { CDPSession, Locator, Page } from "playwright-core";
 import * as NodeCrypto from "node:crypto";
 import { BrowserControlInterrupted } from "./SessionControl.ts";
@@ -408,6 +411,102 @@ export const scroll = async (page: Page, input: PreviewAutomationScrollInput) =>
     return;
   }
   await locator.evaluate((element, [x, y]) => element.scrollBy(x, y), delta);
+};
+
+/** Runs in the page; the inert document avoids upgrading cloned custom elements. */
+const READ_PAGE_SCRIPT = `(selector) => {
+  const roots = selector ? document.querySelectorAll(selector) : null;
+  if (roots && roots.length !== 1) {
+    throw new Error('Reader selector must match exactly one element; matched ' + roots.length + '.');
+  }
+  const root = roots ? roots[0] : document.querySelector('main') ?? document.querySelector('article') ?? document.body;
+  if (!root) throw new Error('Page has no readable content root.');
+  const clone = document.implementation.createHTMLDocument('').importNode(root, true);
+  const sources = [root, ...root.querySelectorAll('*')];
+  const copies = [clone, ...clone.querySelectorAll('*')];
+  const warnings = ['Reads loaded main-frame content only; frames, shadow DOM, canvas and unloaded content are omitted.'];
+  const excluded = 'script,style,nav,footer,input,textarea,select,button,template,noscript,iframe,canvas';
+  const hidden = (node) => {
+    const style = getComputedStyle(node);
+    return node.hidden || style.display === 'none' || style.contentVisibility === 'hidden';
+  };
+  let hiddenRoot = false;
+  for (let ancestor = root; ancestor; ancestor = ancestor.parentElement) {
+    if (hidden(ancestor)) hiddenRoot = true;
+  }
+  for (let i = 0; i < sources.length; i++) {
+    const source = sources[i];
+    const copy = copies[i];
+    if (source.matches(excluded) || hidden(source) || (i === 0 && hiddenRoot)) {
+      if (i === 0) copy.replaceChildren();
+      else copy.remove();
+      continue;
+    }
+    const visibility = getComputedStyle(source).visibility;
+    if (visibility === 'hidden' || visibility === 'collapse') {
+      for (const child of [...copy.childNodes]) {
+        if (child.nodeType === Node.TEXT_NODE) child.remove();
+      }
+    }
+    if (source.hasAttribute('href')) copy.setAttribute('href', source.href ?? source.getAttribute('href'));
+    if (source.hasAttribute('src')) copy.setAttribute('src', source.src ?? source.getAttribute('src'));
+  }
+  const html = clone.outerHTML;
+  if (new TextEncoder().encode(html).length > 1000000) {
+    throw new Error('Readable HTML exceeds the 1000000-byte input limit; select a smaller content root.');
+  }
+  if (location.href.length > 4096 || document.title.length > 2048) {
+    throw new Error('Page URL or title exceeds the reader metadata limit.');
+  }
+  return {html, url: location.href, title: document.title,
+    scope: selector ?? root.tagName.toLowerCase(), warnings};
+}`;
+
+export const read = async (
+  page: Page,
+  input: PreviewAutomationReadInput,
+): Promise<PreviewAutomationReadResult> => {
+  const captured = await page.evaluate<{
+    html: string;
+    url: string;
+    title: string;
+    scope: string;
+    warnings: string[];
+  }>(`(${READ_PAGE_SCRIPT})(${JSON.stringify(input.selector ?? null)})`);
+  // Explicit DOM filtering preserves aside warnings and images that minimal presets discard.
+  const converted = htmlToMarkdown(captured.html, { origin: captured.url });
+  const maxBytes = input.maxBytes ?? 20_000;
+  const result = {
+    url: captured.url,
+    title: captured.title,
+    scope: captured.scope,
+    markdown: "",
+    truncated: true,
+    warnings: [
+      ...captured.warnings,
+      "Markdown was truncated to the output byte limit; select a smaller content root for the remainder.",
+    ],
+  };
+  const metadataBytes = Buffer.byteLength(JSON.stringify(result), "utf8");
+  let markdown = "";
+  let bytes = 0;
+  let jsonBytes = 0;
+  for (const character of converted) {
+    const characterBytes = Buffer.byteLength(character, "utf8");
+    const escapedBytes = Buffer.byteLength(JSON.stringify(character), "utf8") - 2;
+    if (bytes + characterBytes > maxBytes || metadataBytes + jsonBytes + escapedBytes > 60_000)
+      break;
+    markdown += character;
+    bytes += characterBytes;
+    jsonBytes += escapedBytes;
+  }
+  const truncated = markdown.length !== converted.length;
+  return {
+    ...result,
+    markdown,
+    truncated,
+    warnings: truncated ? result.warnings : captured.warnings,
+  };
 };
 
 export const evaluate = async (cdp: CDPSession, input: PreviewAutomationEvaluateInput) => {

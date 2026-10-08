@@ -1,7 +1,21 @@
 import { expect, it } from "@effect/vitest";
 import { Tool } from "effect/ai";
+import * as Schema from "effect/Schema";
+import { PreviewAutomationReadInput } from "@t3tools/contracts";
 
 import { PreviewToolkit } from "./tools.ts";
+
+it("rejects reader requests outside the supported selector and output bounds", () => {
+  const decode = Schema.decodeUnknownOption(PreviewAutomationReadInput);
+  for (const input of [
+    { maxBytes: 511 },
+    { maxBytes: 40_001 },
+    { maxBytes: 512.5 },
+    { selector: "x".repeat(2049) },
+  ])
+    expect(decode(input)._tag).toBe("None");
+  expect(decode({ maxBytes: 40_000, selector: "main" })._tag).toBe("Some");
+});
 
 const schemaHasDescription = (schema: unknown): boolean => {
   if (!schema || typeof schema !== "object") return false;
