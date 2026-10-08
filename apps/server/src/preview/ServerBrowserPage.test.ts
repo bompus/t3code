@@ -97,6 +97,30 @@ describe("server browser page operations", () => {
     expect(await page.evaluate("window.upgrades")).toBe(1);
   });
 
+  it("omits CSS-hidden images while preserving visible descendants and page state", async () => {
+    await page.route("**/*", (route) => route.abort());
+    await page.setContent(`
+      <base href="https://example.invalid/">
+      <style>.loading { visibility: hidden; } .visible { visibility: visible; }</style>
+      <main>
+        <img id="pending" class="loading" src="/pending.png" alt="Hidden pending asset">
+        <div class="loading"><img class="visible" src="/visible.png" alt="Visible asset"><span class="visible">Visible warning</span></div>
+      </main>`);
+    const original = await page.content();
+    const result = await ServerBrowserPage.read(page, {});
+    expect(result.markdown).not.toContain("Hidden pending asset");
+    expect(result.markdown).not.toContain("pending.png");
+    expect(result.markdown).toContain("Visible asset");
+    expect(result.markdown).toContain("visible.png");
+    expect(result.markdown).toContain("Visible warning");
+    expect((await ServerBrowserPage.read(page, { selector: "#pending" })).markdown).toBe("");
+    expect(await page.content()).toBe(original);
+    await page.locator("#pending").evaluate((image) => image.classList.remove("loading"));
+    const loaded = await ServerBrowserPage.read(page, {});
+    expect(loaded.markdown).toContain("Hidden pending asset");
+    expect(loaded.markdown).toContain("pending.png");
+  });
+
   it("selects an exact content root and rejects missing, ambiguous or invalid selectors", async () => {
     await page.setContent(
       "<article><h1>Article fallback</h1></article><section>One</section><section>Two</section>",

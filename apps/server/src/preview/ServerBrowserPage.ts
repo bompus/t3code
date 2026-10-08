@@ -431,6 +431,7 @@ const READ_PAGE_SCRIPT = `(selector) => {
     return node.hidden || style.display === 'none' || style.contentVisibility === 'hidden';
   };
   let hiddenRoot = false;
+  let omitRoot = false;
   for (let ancestor = root; ancestor; ancestor = ancestor.parentElement) {
     if (hidden(ancestor)) hiddenRoot = true;
   }
@@ -438,12 +439,17 @@ const READ_PAGE_SCRIPT = `(selector) => {
     const source = sources[i];
     const copy = copies[i];
     if (source.matches(excluded) || hidden(source) || (i === 0 && hiddenRoot)) {
-      if (i === 0) copy.replaceChildren();
+      if (i === 0) omitRoot = true;
       else copy.remove();
       continue;
     }
     const visibility = getComputedStyle(source).visibility;
     if (visibility === 'hidden' || visibility === 'collapse') {
+      if (source.tagName === 'IMG') {
+        if (i === 0) omitRoot = true;
+        copy.remove();
+        continue;
+      }
       for (const child of [...copy.childNodes]) {
         if (child.nodeType === Node.TEXT_NODE) child.remove();
       }
@@ -451,7 +457,7 @@ const READ_PAGE_SCRIPT = `(selector) => {
     if (source.hasAttribute('href')) copy.setAttribute('href', source.href ?? source.getAttribute('href'));
     if (source.hasAttribute('src')) copy.setAttribute('src', source.src ?? source.getAttribute('src'));
   }
-  const html = clone.outerHTML;
+  const html = omitRoot ? '' : clone.outerHTML;
   if (new TextEncoder().encode(html).length > 1000000) {
     throw new Error('Readable HTML exceeds the 1000000-byte input limit; select a smaller content root.');
   }
