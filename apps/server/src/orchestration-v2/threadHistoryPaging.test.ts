@@ -7,7 +7,7 @@ import {
   type OrchestrationV2ProjectedTurnItem,
   type OrchestrationV2TurnItem,
 } from "@t3tools/contracts";
-import { describe, expect, it } from "@effect/vitest";
+import { describe, expect, it, vi } from "@effect/vitest";
 import * as DateTime from "effect/DateTime";
 
 import {
@@ -682,15 +682,26 @@ describe("threadHistoryPaging", () => {
       const initial = buildBoundedThreadProjection({ projection, snapshotSequence: 9 });
       const bytes = Buffer.byteLength(JSON.stringify(initial.projection), "utf8");
       for (const maxEncodedBytes of [bytes, bytes - 1, 6_000]) {
-        const bounded = buildBoundedThreadProjection({
-          projection,
-          snapshotSequence: 9,
-          policy: { maxItems: 75, maxEncodedBytes },
-        });
-        expect(bounded.payloadBudgetExceeded).toBe(bytes > maxEncodedBytes);
-        expect(bounded.projection).toEqual(initial.projection);
-        expect(bounded.historyCursor).toBe(initial.historyCursor);
-        expect(bounded.hasMoreHistory).toBe(initial.hasMoreHistory);
+        const stringify = vi.spyOn(JSON, "stringify");
+        try {
+          const bounded = buildBoundedThreadProjection({
+            projection,
+            snapshotSequence: 9,
+            policy: { maxItems: 75, maxEncodedBytes },
+          });
+          expect(bounded.payloadBudgetExceeded).toBe(bytes > maxEncodedBytes);
+          expect(bounded.projection).toEqual(initial.projection);
+          expect(bounded.historyCursor).toBe(initial.historyCursor);
+          expect(bounded.hasMoreHistory).toBe(initial.hasMoreHistory);
+          const minimumTextBytes = text.length * (inherited ? 1 : 2);
+          if (minimumTextBytes > maxEncodedBytes) {
+            expect(stringify).not.toHaveBeenCalledWith(bounded.projection);
+          } else {
+            expect(stringify).toHaveBeenCalledWith(bounded.projection);
+          }
+        } finally {
+          stringify.mockRestore();
+        }
       }
     }
   });
