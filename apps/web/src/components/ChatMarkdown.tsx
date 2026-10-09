@@ -17,8 +17,13 @@ import { AuthFilesystemReadScope, AuthOrchestrationOperateScope } from "@t3tools
 import {
   CHAT_MARKDOWN_REMARK_PLUGINS,
   CHAT_MARKDOWN_REMARK_PLUGINS_WITH_BREAKS,
-  CHAT_MARKDOWN_REHYPE_PLUGINS,
 } from "@t3tools/shared/markdownPipeline";
+import {
+  CHAT_MARKDOWN_LITERAL_HTML_REHYPE_PLUGINS,
+  CHAT_MARKDOWN_RENDER_REHYPE_PLUGINS,
+  SANITIZED_FRAGMENT_PREFIX,
+  hastPlainTextDeep,
+} from "./chatMarkdownRehype";
 import { useAtomValue } from "@effect/atom-react";
 import {
   COMPOSER_CONTEXT_CLIPBOARD_MIME,
@@ -91,6 +96,7 @@ import React, {
   useRef,
   useState,
   type ReactNode,
+  type RefObject,
 } from "react";
 import type {
   Components,
@@ -98,6 +104,18 @@ import type {
   Options as ReactMarkdownOptions,
 } from "react-markdown";
 import ReactMarkdown from "react-markdown";
+import type { Element as HastElement, Root as HastRoot } from "hast";
+import { toJsxRuntime } from "hast-util-to-jsx-runtime";
+import { flushSync } from "react-dom";
+import { Fragment, jsx, jsxs } from "react/jsx-runtime";
+import {
+  PROGRESSIVE_CHAT_MARKDOWN_MIN_LENGTH,
+  canRenderChatMarkdownProgressively,
+  prepareChatMarkdownSlice,
+  readChatMarkdownChunks,
+  requestChatMarkdownChunks,
+  scheduleChatMarkdownSlices,
+} from "~/markdown-progressive";
 import { toHtml } from "hast-util-to-html";
 import { createIncrementalMarkdownPlugin } from "../markdown-incremental";
 import { defaultUrlTransform } from "react-markdown";
@@ -1725,20 +1743,6 @@ function plainHastText(node: unknown): string | null {
 }
 
 /**
- * The anchor's words, gathered through any nesting. A context label that picked up emphasis or a
- * code span still has to read as its label; `plainHastText` gives up on the first non-text child,
- * which would leave the raw context id showing in its place.
- */
-function hastPlainTextDeep(node: unknown): string {
-  if (!node || typeof node !== "object") return "";
-  if ("type" in node && node.type === "text" && "value" in node && typeof node.value === "string") {
-    return node.value;
-  }
-  if (!("children" in node) || !Array.isArray(node.children)) return "";
-  return node.children.map(hastPlainTextDeep).join("");
-}
-
-/**
  * Whether the link carries any words of its own. An anchor that is only an image — a badge, a
  * "Fix in Cursor" button — already shows its identity, and a favicon bolted on in front of it
  * is a stray logo rather than a hint.
@@ -1756,8 +1760,6 @@ function hastHasText(node: unknown): boolean {
   }
   return "children" in node && Array.isArray(node.children) && node.children.some(hastHasText);
 }
-
-const SANITIZED_FRAGMENT_PREFIX = "user-content-";
 
 function decodeMarkdownFragmentId(href: string): string {
   const encodedId = href.slice(1);
@@ -1795,6 +1797,9 @@ function findMarkdownFragmentTarget(anchor: HTMLAnchorElement, href: string): HT
   );
 }
 
+/** Set on a message's root while the rest of a long message is still mounting. */
+const MARKDOWN_MOUNTING_ATTRIBUTE = "data-markdown-mounting";
+
 function handleMarkdownFragmentClick(event: ReactMouseEvent<HTMLAnchorElement>, href: string) {
   if (
     event.defaultPrevented ||
@@ -1810,73 +1815,25 @@ function handleMarkdownFragmentClick(event: ReactMouseEvent<HTMLAnchorElement>, 
   // Never let the browser follow the fragment or write it to the URL: desktop keeps
   // its route in the hash, so replacing the hash navigates away from the thread.
   event.preventDefault();
-  findMarkdownFragmentTarget(event.currentTarget, href)?.scrollIntoView({ block: "start" });
+  const anchor = event.currentTarget;
+  const scroll = () => findMarkdownFragmentTarget(anchor, href)?.scrollIntoView({ block: "start" });
+  // The message's own target may not be mounted yet, and a same-named heading in another
+  // message must not win in the meantime, so wait for the rest of the message.
+  const markdownRoot = anchor.closest<HTMLElement>(".chat-markdown");
+  if (!markdownRoot?.hasAttribute(MARKDOWN_MOUNTING_ATTRIBUTE)) {
+    scroll();
+    return;
+  }
+  const observer = new MutationObserver(() => {
+    if (markdownRoot.hasAttribute(MARKDOWN_MOUNTING_ATTRIBUTE)) return;
+    observer.disconnect();
+    if (anchor.isConnected) scroll();
+  });
+  observer.observe(markdownRoot, {
+    attributes: true,
+    attributeFilter: [MARKDOWN_MOUNTING_ATTRIBUTE],
+  });
 }
-
-type HeadingHastNode = {
-  type?: string;
-  tagName?: string;
-  properties?: Record<string, unknown>;
-  children?: HeadingHastNode[];
-};
-
-/** GitHub's heading anchor slug, so `[Setup](#setup)` table-of-contents links find their heading. */
-function githubHeadingSlug(text: string): string {
-  return text
-    .trim()
-    .toLowerCase()
-    .replace(/[^\p{L}\p{M}\p{N}\p{Pc} -]/gu, "")
-    .replace(/ /g, "-");
-}
-
-/**
- * Gives headings without an authored id GitHub's slug id, deduplicated per document. Like the
- * sanitizer's ids, they carry the `user-content-` prefix so they cannot clobber app element ids;
- * fragment lookup strips it.
- */
-function rehypeHeadingIds() {
-  return (tree: HeadingHastNode) => {
-    // Every id already in the document, authored or assigned, so a suffix never
-    // lands on one that exists: `Setup`, `Setup`, `Setup-1` get three distinct ids.
-    const taken = new Set<string>();
-    const collect = (node: HeadingHastNode) => {
-      const id = node.properties?.id;
-      if (typeof id === "string") taken.add(id);
-      node.children?.forEach(collect);
-    };
-    collect(tree);
-    const nextSuffix = new Map<string, number>();
-    const visit = (node: HeadingHastNode) => {
-      if (node.type === "element" && node.tagName && /^h[1-6]$/.test(node.tagName)) {
-        const slug = githubHeadingSlug(hastPlainTextDeep(node));
-        if (node.properties?.id === undefined && slug) {
-          let count = nextSuffix.get(slug) ?? 0;
-          let id = `${SANITIZED_FRAGMENT_PREFIX}${slug}`;
-          while (taken.has(id)) {
-            count += 1;
-            id = `${SANITIZED_FRAGMENT_PREFIX}${slug}-${count}`;
-          }
-          nextSuffix.set(slug, count);
-          taken.add(id);
-          node.properties = { ...node.properties, id };
-        }
-        return;
-      }
-      node.children?.forEach(visit);
-    };
-    visit(tree);
-  };
-}
-
-// Heading ids are added after sanitizing, which would prefix them a second time.
-const CHAT_MARKDOWN_RENDER_REHYPE_PLUGINS = [
-  ...CHAT_MARKDOWN_REHYPE_PLUGINS,
-  rehypeHeadingIds,
-] satisfies NonNullable<ReactMarkdownOptions["rehypePlugins"]>;
-
-const CHAT_MARKDOWN_LITERAL_HTML_REHYPE_PLUGINS = [rehypeHeadingIds] satisfies NonNullable<
-  ReactMarkdownOptions["rehypePlugins"]
->;
 
 function MarkdownExternalLinkContent({
   host,
@@ -3378,6 +3335,108 @@ const CHAT_MARKDOWN_COMPONENTS = {
   },
 } satisfies Components;
 
+type MarkdownUrlTransform = (url: string, key: string, node: HastElement) => string;
+
+const ChatMarkdownSlice = memo(function ChatMarkdownSlice({
+  tree,
+  urlTransform,
+}: {
+  tree: HastRoot;
+  urlTransform: MarkdownUrlTransform;
+}) {
+  return toJsxRuntime(prepareChatMarkdownSlice(tree, urlTransform), {
+    Fragment,
+    components: CHAT_MARKDOWN_COMPONENTS,
+    ignoreInvalidStyle: true,
+    jsx,
+    jsxs,
+    passKeys: true,
+    passNode: true,
+  });
+});
+
+interface ProgressiveMarkdownState {
+  readonly chunks: readonly HastRoot[] | null;
+  readonly visible: number;
+  readonly failed: boolean;
+}
+
+/**
+ * Renders a long completed message without one long main-thread task: the worker parses it, the
+ * first slice mounts, and the rest mount in shared ~12 ms slices. The previous text's slices stay
+ * up until the new parse arrives. If the worker fails, `fallback` renders the message in one pass.
+ */
+function ProgressiveChatMarkdownBody({
+  text,
+  lineBreaks,
+  urlTransform,
+  fallback,
+  rootRef,
+}: {
+  text: string;
+  lineBreaks: boolean;
+  urlTransform: MarkdownUrlTransform;
+  fallback: ReactNode;
+  rootRef: RefObject<HTMLDivElement | null>;
+}) {
+  const [state, setState] = useState<ProgressiveMarkdownState>(() => {
+    // A remounted row (virtualized list) shows its first slice in the same frame.
+    const chunks = readChatMarkdownChunks(text, lineBreaks) ?? null;
+    return { chunks, visible: chunks ? 1 : 0, failed: false };
+  });
+  useEffect(() => {
+    let cancelled = false;
+    let cancelSlices: (() => void) | undefined;
+    const root = rootRef.current;
+    root?.setAttribute(MARKDOWN_MOUNTING_ATTRIBUTE, "");
+    const mounted = () => root?.removeAttribute(MARKDOWN_MOUNTING_ATTRIBUTE);
+    requestChatMarkdownChunks(text, lineBreaks).then(
+      (chunks) => {
+        if (cancelled) return;
+        let visible = 1;
+        flushSync(() =>
+          setState((current) =>
+            current.chunks === chunks ? current : { chunks, visible, failed: false },
+          ),
+        );
+        if (chunks.length <= 1) {
+          mounted();
+          return;
+        }
+        cancelSlices = scheduleChatMarkdownSlices(() => {
+          visible += 1;
+          flushSync(() =>
+            setState((current) =>
+              current.chunks === chunks && current.visible < visible
+                ? { ...current, visible }
+                : current,
+            ),
+          );
+          if (visible < chunks.length) return true;
+          mounted();
+          return false;
+        });
+      },
+      () => {
+        if (cancelled) return;
+        flushSync(() => setState({ chunks: null, visible: 0, failed: true }));
+        mounted();
+      },
+    );
+    return () => {
+      cancelled = true;
+      cancelSlices?.();
+      mounted();
+    };
+  }, [text, lineBreaks, rootRef]);
+
+  if (state.failed) return fallback;
+  return state.chunks?.slice(0, state.visible).map((tree, index) => (
+    // oxlint-disable-next-line react/no-array-index-key -- Slices of one parse only append, so the index is their identity.
+    <ChatMarkdownSlice key={index} tree={tree} urlTransform={urlTransform} />
+  ));
+}
+
 function ChatMarkdown({
   text,
   className,
@@ -3398,6 +3457,16 @@ function ChatMarkdown({
     props.isStreaming === true &&
     extraRemarkPlugins.length === 0 &&
     /(?:^|\n) {0,3}(?:`{3}|~{3})/.test(text);
+  // Only messages that mount already complete: a message that streamed in keeps the path it
+  // rendered with, so finishing does not blank it while the worker parses.
+  const [mountedComplete] = useState(props.isStreaming !== true);
+  const progressive =
+    mountedComplete &&
+    props.isStreaming !== true &&
+    extraRemarkPlugins.length === 0 &&
+    parseRawHtml &&
+    text.length >= PROGRESSIVE_CHAT_MARKDOWN_MIN_LENGTH &&
+    canRenderChatMarkdownProgressively();
   const remarkPlugins = useMemo(
     () => [
       ...(lineBreaks ? CHAT_MARKDOWN_REMARK_PLUGINS_WITH_BREAKS : CHAT_MARKDOWN_REMARK_PLUGINS),
@@ -3410,6 +3479,21 @@ function ChatMarkdown({
   // react-markdown converts unparsed HTML nodes to text when skipHtml is false.
   // Keep that behavior explicit because literal mode depends on escaping the
   // complete source token instead of dropping it from the rendered message.
+  const markdown = (
+    <ReactMarkdown
+      remarkPlugins={remarkPlugins}
+      rehypePlugins={
+        parseRawHtml
+          ? CHAT_MARKDOWN_RENDER_REHYPE_PLUGINS
+          : CHAT_MARKDOWN_LITERAL_HTML_REHYPE_PLUGINS
+      }
+      skipHtml={false}
+      components={CHAT_MARKDOWN_COMPONENTS}
+      urlTransform={markdownUrlTransform}
+    >
+      {text}
+    </ReactMarkdown>
+  );
   return (
     <div
       ref={markdownRef}
@@ -3422,19 +3506,17 @@ function ChatMarkdown({
       onCopy={handleCopy}
     >
       <ChatMarkdownRendererContext value={componentState}>
-        <ReactMarkdown
-          remarkPlugins={remarkPlugins}
-          rehypePlugins={
-            parseRawHtml
-              ? CHAT_MARKDOWN_RENDER_REHYPE_PLUGINS
-              : CHAT_MARKDOWN_LITERAL_HTML_REHYPE_PLUGINS
-          }
-          skipHtml={false}
-          components={CHAT_MARKDOWN_COMPONENTS}
-          urlTransform={markdownUrlTransform}
-        >
-          {text}
-        </ReactMarkdown>
+        {progressive ? (
+          <ProgressiveChatMarkdownBody
+            text={text}
+            lineBreaks={lineBreaks}
+            urlTransform={markdownUrlTransform}
+            fallback={markdown}
+            rootRef={markdownRef}
+          />
+        ) : (
+          markdown
+        )}
       </ChatMarkdownRendererContext>
       {localMediaPreview ? (
         <ExpandedImageDialog

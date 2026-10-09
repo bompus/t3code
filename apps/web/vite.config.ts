@@ -156,9 +156,26 @@ const configuredAllowedHosts = (process.env.T3CODE_DEV_ALLOWED_HOSTS ?? "")
   .filter((entry) => entry.length > 0);
 const allowedHosts = [".ts.net", ...configuredAllowedHosts];
 
+// micromark decodes named character references through `document` under the browser
+// condition. Workers have no document, so the markdown worker gets the package's table build.
+function workerSafeEntityDecoder(): Plugin {
+  return {
+    name: "t3:worker-safe-entity-decoder",
+    enforce: "pre",
+    async resolveId(source, importer, options) {
+      if (source !== "decode-named-character-reference") return null;
+      const resolved = await this.resolve(source, importer, { ...options, skipSelf: true });
+      return resolved && { ...resolved, id: resolved.id.replace(/index\.dom\.js$/, "index.js") };
+    },
+  };
+}
+
 export default defineConfig(() => {
   return {
     assetsInclude: ["**/*.wasm"],
+    worker: {
+      plugins: () => [workerSafeEntityDecoder()],
+    },
     plugins: [
       devCompressionPlugin(),
       thirdPartyLicensesPlugin({
@@ -186,6 +203,9 @@ export default defineConfig(() => {
       tailwindPlugins(bundledDev),
     ],
     optimizeDeps: {
+      // The dev server pre-bundles dependencies once for the page and the worker, so the worker
+      // decoder has to be swapped here too.
+      rolldownOptions: { plugins: [workerSafeEntityDecoder()] },
       include: [
         "@clerk/clerk-js",
         "@clerk/react/internal",

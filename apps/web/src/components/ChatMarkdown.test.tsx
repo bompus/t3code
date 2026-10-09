@@ -13,11 +13,38 @@ import { create, type ReactTestRenderer } from "react-test-renderer";
 import { describe, expect, it, vi } from "vite-plus/test";
 
 import { getSyntaxHighlighterPromise } from "../lib/syntaxHighlighting";
+import { PROGRESSIVE_CHAT_MARKDOWN_MIN_LENGTH } from "../markdown-progressive";
 import { GitHubIcon } from "./Icons";
 import { Button } from "./ui/button";
 import { setMarkdownTaskChecked } from "./files/filePreviewMode";
 
 vi.mock("@effect/atom-react", () => ({ useAtomValue: () => null }));
+const progressiveMarkdown = vi.hoisted(() => ({
+  enabled: false,
+  fail: false,
+  requests: 0,
+  // When set, slices wait here for the test to run them instead of the frame scheduler.
+  heldSlices: null as Array<() => boolean> | null,
+}));
+vi.mock("../markdown-progressive", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../markdown-progressive")>();
+  const { parseChatMarkdownChunks } = await import("../markdown-progressive-pipeline");
+  // jsdom has no module workers; parse on this thread through the worker's own pipeline.
+  return {
+    ...actual,
+    canRenderChatMarkdownProgressively: () => progressiveMarkdown.enabled,
+    requestChatMarkdownChunks: async (text: string, lineBreaks: boolean) => {
+      progressiveMarkdown.requests += 1;
+      if (progressiveMarkdown.fail) throw new Error("Markdown worker failed");
+      return parseChatMarkdownChunks(text, lineBreaks);
+    },
+    scheduleChatMarkdownSlices: (task: () => boolean) => {
+      if (!progressiveMarkdown.heldSlices) return actual.scheduleChatMarkdownSlices(task);
+      progressiveMarkdown.heldSlices.push(task);
+      return () => {};
+    },
+  };
+});
 vi.mock("./chat/MermaidDiagram", () => ({
   // Real Mermaid needs layout APIs jsdom lacks; a rendered diagram is an SVG.
   MermaidDiagram: () => <svg aria-label="Diagram" />,
@@ -1345,4 +1372,128 @@ describe("ChatMarkdown in-page links", () => {
       }
     },
   );
+});
+
+describe("ChatMarkdown progressive rendering", () => {
+  const SECTIONS = 400;
+  const section = (index: number) =>
+    [
+      // Repeated titles check that heading ids stay unique across slices.
+      `## Section ${index % 7}`,
+      `Text with **bold**, *em*, \`inline\`, a [reference][ref], [unsafe](javascript:alert(1)), <kbd>K</kbd> &amp; &NotEqualTilde;.\nA second line ${index}.`,
+      `- item ${index}\n  - nested`,
+      `| a | b |\n| - | - |\n| ${index} | [file](/tmp/project/src/a.ts#L3) [uri](file:///tmp/project/src/b.ts#L4) |`,
+      `> [!NOTE]\n> Alert ${index}.`,
+      `<details><summary>More ${index}</summary>\n\nBody\n\n</details>`,
+      index % 60 === 0 ? `\`\`\`text\ncode ${index}\n\`\`\`` : `[toc](#section-${index % 7})`,
+    ].join("\n\n");
+  const text = [
+    "<script>alert(1)</script>",
+    ...Array.from({ length: SECTIONS }, (_, index) => section(index)),
+    '[ref]: https://example.com/ref "Ref"',
+    "End of message.",
+  ].join("\n\n");
+
+  async function renderSettled(options: { progressive: boolean; lineBreaks: boolean }) {
+    progressiveMarkdown.enabled = options.progressive;
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    try {
+      await act(async () => {
+        root.render(
+          <ChatMarkdown cwd="/tmp/project" text={text} lineBreaks={options.lineBreaks} />,
+        );
+      });
+      // Slices mount across frames and code blocks highlight asynchronously.
+      await act(() =>
+        vi.waitFor(
+          () => {
+            // Slices mount in order, so the last paragraph means every slice is in.
+            expect([...container.querySelectorAll("p")].at(-1)?.textContent).toBe(
+              "End of message.",
+            );
+            expect(container.querySelectorAll(".chat-markdown-shiki")).toHaveLength(
+              Math.ceil(SECTIONS / 60),
+            );
+          },
+          { timeout: 20_000 },
+        ),
+      );
+      return container.innerHTML.replace(/_r_[0-9a-z]+_/g, "_r_");
+    } finally {
+      await act(async () => root.unmount());
+      container.remove();
+      progressiveMarkdown.enabled = false;
+    }
+  }
+
+  it.each([false, true])(
+    "renders the same DOM as the synchronous path (line breaks: %s)",
+    async (lineBreaks) => {
+      await getSyntaxHighlighterPromise("text");
+      expect(text.length).toBeGreaterThanOrEqual(PROGRESSIVE_CHAT_MARKDOWN_MIN_LENGTH);
+      const expected = await renderSettled({ progressive: false, lineBreaks });
+      progressiveMarkdown.requests = 0;
+      const progressive = await renderSettled({ progressive: true, lineBreaks });
+      expect(progressiveMarkdown.requests).toBe(1);
+      expect(progressive).toBe(expected);
+      expect(expected).not.toMatch(/<script|javascript:/);
+      expect(expected).toContain('id="user-content-section-0-1"');
+      expect(expected).toContain('href="https://example.com/ref"');
+    },
+    60_000,
+  );
+
+  it("waits for its own heading before following a link in a message still mounting", async () => {
+    const scrollIntoView = vi.fn();
+    const originalScrollIntoView = HTMLElement.prototype.scrollIntoView;
+    HTMLElement.prototype.scrollIntoView = scrollIntoView;
+    progressiveMarkdown.enabled = true;
+    const heldSlices: Array<() => boolean> = [];
+    progressiveMarkdown.heldSlices = heldSlices;
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    const long = `[Jump](#target)\n\n${text.replace("End of message.", "## Target\n\nEnd of message.")}`;
+    try {
+      await act(async () => {
+        root.render(
+          <>
+            <ChatMarkdown cwd="/tmp/project" text={"## Target\n\nAn earlier message."} />
+            <ChatMarkdown cwd="/tmp/project" text={long} />
+          </>,
+        );
+      });
+      const message = container.querySelectorAll<HTMLElement>(".chat-markdown")[1]!;
+      expect(message.hasAttribute("data-markdown-mounting")).toBe(true);
+      const click = new MouseEvent("click", { bubbles: true, cancelable: true });
+      message.querySelector("a")!.dispatchEvent(click);
+      expect(click.defaultPrevented).toBe(true);
+      expect(scrollIntoView).not.toHaveBeenCalled();
+
+      await act(async () => {
+        for (const slice of heldSlices) while (slice());
+      });
+      expect(message.hasAttribute("data-markdown-mounting")).toBe(false);
+      expect(scrollIntoView.mock.contexts).toEqual([message.querySelector("#user-content-target")]);
+    } finally {
+      await act(async () => root.unmount());
+      container.remove();
+      progressiveMarkdown.enabled = false;
+      progressiveMarkdown.heldSlices = null;
+      HTMLElement.prototype.scrollIntoView = originalScrollIntoView;
+    }
+  }, 60_000);
+
+  it("renders the whole message in one pass when the worker fails", async () => {
+    await getSyntaxHighlighterPromise("text");
+    const expected = await renderSettled({ progressive: false, lineBreaks: false });
+    progressiveMarkdown.fail = true;
+    try {
+      expect(await renderSettled({ progressive: true, lineBreaks: false })).toBe(expected);
+    } finally {
+      progressiveMarkdown.fail = false;
+    }
+  }, 60_000);
 });
