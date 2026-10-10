@@ -15,9 +15,27 @@ import {
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Tracer from "effect/Tracer";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
+
+const traceSqlStatements = () => {
+  const statements: Array<string> = [];
+  const tracer = Tracer.make({
+    span(options) {
+      const span = new Tracer.NativeSpan(options);
+      const end = span.end.bind(span);
+      span.end = (endTime, exit) => {
+        end(endTime, exit);
+        const query = span.attributes.get("db.query.text");
+        if (typeof query === "string") statements.push(query);
+      };
+      return span;
+    },
+  });
+  return { statements, tracer };
+};
 
 const layerDatabase = Layer.mergeAll(
   SqlitePersistence.layerMemory,
@@ -104,6 +122,30 @@ it.effect.each(["sqlite", "memory"] as const)(
           threadId,
           runId,
           parentNodeId: null,
+          rootNodeId: run.rootNodeId!,
+          kind: "root_turn",
+          status: "pending",
+          countsForRun: true,
+          providerThreadId: null,
+          providerTurnId: null,
+          nativeItemRef: null,
+          runtimeRequestId: null,
+          checkpointScopeId: scopeId,
+          startedAt: null,
+          completedAt: null,
+        },
+      });
+      // A second node in the thread proves the start context keeps only the run's root.
+      yield* store.apply({
+        id: EventId.make("startup:other-node-event"),
+        type: "node.updated",
+        threadId,
+        occurredAt: now,
+        payload: {
+          id: NodeId.make("startup:other-node"),
+          threadId,
+          runId,
+          parentNodeId: run.rootNodeId!,
           rootNodeId: run.rootNodeId!,
           kind: "root_turn",
           status: "pending",
@@ -272,8 +314,38 @@ it.effect.each(["sqlite", "memory"] as const)(
         (yield* store.getTimelinePage(threadId, { view: "messages", limit: 1 })).items,
         [],
       );
-      const context = yield* store.getTurnStartContext(threadId, runId);
+      const { statements, tracer } = traceSqlStatements();
+      const context = yield* store
+        .getTurnStartContext(threadId, runId)
+        .pipe(Effect.withTracer(tracer));
       assert.equal(context.thread.id, threadId);
+      assert.include(
+        context.nodes.map((node) => node.id),
+        run.rootNodeId,
+      );
+      if (storage === "sqlite") {
+        // The SQL store reads only the run's root; the in-memory store returns every node.
+        assert.deepEqual(
+          context.nodes.map((node) => node.id),
+          [run.rootNodeId],
+        );
+        const nodeStatement = statements.find(
+          (statement) =>
+            statement.includes("payload_json") &&
+            statement.includes("orchestration_v2_projection_nodes AS node"),
+        );
+        assert.isDefined(nodeStatement);
+        const nodePlan = yield* (yield* SqlClient.SqlClient).unsafe<{ readonly detail: string }>(
+          `EXPLAIN QUERY PLAN ${nodeStatement}`,
+        );
+        // The start of a turn must not scan the thread's nodes, however many it holds.
+        assert.deepEqual(
+          nodePlan.map((row) => row.detail).filter((detail) => detail.startsWith("SEARCH node ")),
+          [
+            "SEARCH node USING INDEX sqlite_autoindex_orchestration_v2_projection_nodes_1 (node_id=?)",
+          ],
+        );
+      }
       assert.deepEqual(
         context.checkpointScopes.map((scope) => scope.id),
         [scopeId],

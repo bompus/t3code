@@ -3888,9 +3888,18 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               SELECT payload_json FROM orchestration_v2_projection_run_attempts
               WHERE thread_id = ${threadId} ORDER BY run_id ASC, attempt_ordinal ASC
             `.pipe(Effect.flatMap(decodeRows(decodeRunAttemptPayload, threadId)));
+            // Keep the run's root node ID outermost so SQLite looks the node up by
+            // primary key instead of scanning every node of the thread.
             const nodes = yield* sql<PayloadRow>`
-              SELECT payload_json FROM orchestration_v2_projection_nodes
-              WHERE thread_id = ${threadId} AND node_id IN (SELECT json_extract(payload_json, '$.rootNodeId') FROM orchestration_v2_projection_runs WHERE thread_id = ${threadId} AND run_id = ${runId}) ORDER BY node_id ASC
+              SELECT node.payload_json
+              FROM (
+                SELECT json_extract(payload_json, '$.rootNodeId') AS root_node_id
+                FROM orchestration_v2_projection_runs
+                WHERE thread_id = ${threadId} AND run_id = ${runId}
+              ) AS run
+              CROSS JOIN orchestration_v2_projection_nodes AS node ON node.node_id = run.root_node_id
+              WHERE node.thread_id = ${threadId}
+              ORDER BY node.node_id ASC
             `.pipe(Effect.flatMap(decodeRows(decodeNodePayload, threadId)));
             const subagents = yield* sql<PayloadRow>`
               SELECT payload_json FROM orchestration_v2_projection_subagents
