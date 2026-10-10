@@ -442,7 +442,8 @@ it.live("restarts selection as a new attempt and retries after old-session clean
           return yield* Effect.die("active restart test run is missing");
         }
 
-        yield* orchestrator.dispatch({
+        const previousRootNodeId = activeProjection.runs[0]?.rootNodeId;
+        const restart = yield* orchestrator.dispatch({
           type: "message.dispatch",
           createdBy: "user",
           creationSource: "web",
@@ -458,7 +459,12 @@ it.live("restarts selection as a new attempt and retries after old-session clean
           const current = yield* orchestrator.getThreadProjection(threadId);
           if (current.attempts.length === 2 && current.attempts[1]?.status === "completed") {
             const captured = yield* Ref.get(state);
-            return { projection: current, captured };
+            const interruptedRootNodes = restart.storedEvents.filter(
+              (stored) =>
+                stored.event.type === "node.updated" &&
+                stored.event.payload.status === "interrupted",
+            );
+            return { projection: current, captured, interruptedRootNodes, previousRootNodeId };
           }
           yield* Effect.sleep("5 millis");
         }
@@ -483,7 +489,15 @@ it.live("restarts selection as a new attempt and retries after old-session clean
           ),
         ),
       );
-      const { projection, captured } = result;
+      const { projection, captured, interruptedRootNodes, previousRootNodeId } = result;
+
+      // The restart settles the superseded attempt's root node.
+      assert.deepEqual(
+        interruptedRootNodes.map((stored) =>
+          stored.event.type === "node.updated" ? stored.event.payload.id : null,
+        ),
+        [previousRootNodeId],
+      );
 
       assert.lengthOf(projection.runs, 1);
       assert.lengthOf(projection.attempts, 2);

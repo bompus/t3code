@@ -1039,6 +1039,16 @@ describe("orchestrator MCP toolkit", () => {
               acknowledgedCoalesced.runs.find((run) => run.id === parentRun.id)?.delegatedCompletion
                 ?.delivery,
             ).toBeNull();
+            // Cancelling the queued delivery also settles its attempt and root node.
+            expect(
+              acknowledgedCoalesced.attempts.find(
+                (attempt) => attempt.runId === queuedCoalescedRun.id,
+              )?.status,
+            ).toBe("cancelled");
+            expect(
+              acknowledgedCoalesced.nodes.find((node) => node.id === queuedCoalescedRun.rootNodeId)
+                ?.status,
+            ).toBe("cancelled");
             yield* Ref.set(continuationOffers, []);
 
             // Waiting only observes the child run's status. A direct parent
