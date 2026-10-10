@@ -132,6 +132,11 @@ import {
 import { planThreadDeletion } from "./ThreadDeletion.ts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 
+/** Nodes a command has already written. Stored nodes are read by id with `readCommandNode`. */
+type WrittenNodes = {
+  readonly nodes?: ReadonlyArray<OrchestrationV2ThreadProjection["nodes"][number]>;
+};
+
 export class OrchestratorDispatchError extends Schema.TaggedError<OrchestratorDispatchError>()(
   "OrchestratorDispatchError",
   {
@@ -924,6 +929,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
 
   // Command decisions need control records, not historical assistant/tool output.
   // Handoff preparation explicitly reads its history after choosing a strategy.
+  // Nodes are not read: `nodes` stays empty here, and a command that needs a stored
+  // node reads it by id with `readCommandNode`.
   const readCommandProjection = (threadId: ThreadId) =>
     projectionStore
       .getThreadRecords(
@@ -931,7 +938,6 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         [
           "runs",
           "attempts",
-          "nodes",
           "subagents",
           "providerSessions",
           "providerThreads",
@@ -947,6 +953,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       .pipe(
         Effect.map((records): OrchestrationV2ThreadProjection => ({
           ...records,
+          nodes: [],
           checkpoints: [],
           plans: [],
           contextHandoffs: [],
@@ -955,6 +962,23 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         })),
         Effect.mapError((cause) => new OrchestratorProjectionError({ threadId, cause })),
       );
+
+  // A command projection holds no stored nodes, only the ones this command has
+  // already written. A node stored earlier is read here by id.
+  const readCommandNode = (
+    threadId: ThreadId,
+    nodeId: NodeId | null | undefined,
+    written?: ReadonlyArray<OrchestrationV2ThreadProjection["nodes"][number]>,
+  ) =>
+    Effect.gen(function* () {
+      if (nodeId === null || nodeId === undefined) return undefined;
+      const pending = written?.find((candidate) => candidate.id === nodeId);
+      if (pending !== undefined) return pending;
+      const stored = yield* projectionStore
+        .getThreadRecords(threadId, ["nodes"], { nodeIds: [nodeId] })
+        .pipe(Effect.mapError((cause) => new OrchestratorProjectionError({ threadId, cause })));
+      return stored.nodes[0];
+    });
 
   const readHandoffItems = (threadId: ThreadId, runIds?: ReadonlyArray<RunId | null>) =>
     projectionStore
@@ -1102,15 +1126,16 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   const emitQueuedRunCancellation = (input: {
     readonly command: OrchestrationV2ServerCommand;
     readonly events: Ref.Ref<Array<OrchestrationV2DomainEvent>>;
-    readonly projection: Pick<OrchestrationV2ThreadProjection, "nodes" | "attempts">;
+    readonly projection: Pick<OrchestrationV2ThreadProjection, "attempts"> & WrittenNodes;
     readonly run: OrchestrationV2Run;
     readonly now: DateTime.Utc;
   }) =>
     Effect.gen(function* () {
-      const rootNode =
-        input.run.rootNodeId === null
-          ? undefined
-          : input.projection.nodes.find((candidate) => candidate.id === input.run.rootNodeId);
+      const rootNode = yield* readCommandNode(
+        input.run.threadId,
+        input.run.rootNodeId,
+        input.projection.nodes,
+      );
       const attempt =
         input.run.activeAttemptId === null
           ? undefined
@@ -1340,7 +1365,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         });
       }
 
-      const rootNode = projection.nodes.find((candidate) => candidate.id === rootNodeId);
+      const rootNode = yield* readCommandNode(threadId, rootNodeId);
       const attempt = projection.attempts.find((candidate) => candidate.id === attemptId);
       const queuedMessage = projection.messages.find(
         (candidate) => candidate.id === queuedRun.userMessageId,
@@ -1922,7 +1947,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       const projection = yield* projectionStore
         .getThreadRecords(
           command.parentThreadId,
-          ["subagents", "runs", "messages", "nodes", "attempts", "turnItems"],
+          ["subagents", "runs", "messages", "attempts", "turnItems"],
           { turnItemTypes: [], messageRoles: ["user"] },
         )
         .pipe(
@@ -2078,8 +2103,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     readonly events: Ref.Ref<Array<OrchestrationV2DomainEvent>>;
     readonly projection: Pick<
       OrchestrationV2ThreadProjection,
-      "runs" | "subagents" | "messages" | "nodes" | "attempts"
-    >;
+      "runs" | "subagents" | "messages" | "attempts"
+    > &
+      WrittenNodes;
     readonly parentRunId: RunId;
     readonly disposition: "stopped" | "disposed";
     readonly now: DateTime.Utc;
@@ -2161,8 +2187,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     readonly events: Ref.Ref<Array<OrchestrationV2DomainEvent>>;
     readonly projection: Pick<
       OrchestrationV2ThreadProjection,
-      "runs" | "subagents" | "messages" | "nodes" | "attempts"
-    >;
+      "runs" | "subagents" | "messages" | "attempts"
+    > &
+      WrittenNodes;
     readonly now: DateTime.Utc;
     readonly cancelQueuedDelivery?: boolean;
   }) =>
@@ -3759,10 +3786,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       | "providerTurns"
       | "subagents"
       | "attempts"
-      | "nodes"
       | "thread"
       | "turnItems"
-    >;
+    > &
+      WrittenNodes;
     readonly modelSelection: ModelSelection;
     readonly targetRunId: OrchestrationV2Run["id"];
     readonly messageId: OrchestrationV2ConversationMessage["id"];
@@ -4065,8 +4092,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       const currentAttempt = input.projection.attempts.find(
         (candidate) => candidate.id === targetRun.activeAttemptId,
       );
-      const currentRootNode = input.projection.nodes.find(
-        (candidate) => candidate.id === rootNodeId,
+      const currentRootNode = yield* readCommandNode(
+        targetRun.threadId,
+        rootNodeId,
+        input.projection.nodes,
       );
       const attemptOrdinal =
         Math.max(
@@ -6506,7 +6535,6 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       const parentProjection = yield* projectionStore
         .getThreadRecords(command.parentThreadId, [
           "runs",
-          "nodes",
           "subagents",
           "providerThreads",
           "providerTurns",
@@ -6538,9 +6566,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           cause: `Parent run ${command.parentRunId} is stopping.`,
         });
       }
-      const parentNode = parentProjection.nodes.find(
-        (candidate) => candidate.id === command.parentNodeId,
-      );
+      const parentNode = yield* readCommandNode(command.parentThreadId, command.parentNodeId);
       if (
         parentNode === undefined ||
         parentNode.runId !== parentRun.id ||
@@ -7526,7 +7552,6 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           command.threadId,
           [
             "runs",
-            "nodes",
             "attempts",
             "messages",
             "providerThreads",
@@ -7556,10 +7581,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           cause: `Queued run ${command.queuedRunId} is not queued.`,
         });
       }
-      const queuedRootNode =
-        queuedRun.rootNodeId === null
-          ? undefined
-          : projection.nodes.find((candidate) => candidate.id === queuedRun.rootNodeId);
+      const queuedRootNode = yield* readCommandNode(command.threadId, queuedRun.rootNodeId);
       const queuedAttempt =
         queuedRun.activeAttemptId === null
           ? undefined
@@ -7754,7 +7776,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       const projection = yield* projectionStore
         .getThreadRecords(
           command.threadId,
-          ["runs", "messages", "nodes", "attempts", "subagents", "turnItems"],
+          ["runs", "messages", "attempts", "subagents", "turnItems"],
           { turnItemTypes: [], messageRoles: ["user"] },
         )
         .pipe(
@@ -7783,10 +7805,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         });
         return;
       }
-      const queuedRootNode =
-        queuedRun.rootNodeId === null
-          ? undefined
-          : projection.nodes.find((candidate) => candidate.id === queuedRun.rootNodeId);
+      const queuedRootNode = yield* readCommandNode(command.threadId, queuedRun.rootNodeId);
       const queuedAttempt =
         queuedRun.activeAttemptId === null
           ? undefined
@@ -7957,34 +7976,37 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     >,
     projection: Pick<
       OrchestrationV2ThreadProjection,
-      "runs" | "attempts" | "nodes" | "providerThreads" | "turnItems"
+      "runs" | "attempts" | "providerThreads" | "turnItems"
     >,
-  ) => {
-    const run = projection.runs.find((candidate) => candidate.id === command.runId);
-    const attempt = projection.attempts.find((candidate) => candidate.id === run?.activeAttemptId);
-    const rootNode = projection.nodes.find((candidate) => candidate.id === run?.rootNodeId);
-    const providerThread = projection.providerThreads.find(
-      (candidate) => candidate.id === run?.providerThreadId,
-    );
-    const preparationItem = projection.turnItems.find(
-      (
-        candidate,
-      ): candidate is Extract<OrchestrationV2TurnItem, { readonly type: "command_execution" }> =>
-        candidate.runId === command.runId &&
-        candidate.type === "command_execution" &&
-        candidate.input === WORKSPACE_PREPARATION_INPUT,
-    );
-    if (
-      run?.status !== (command.type === "prepared-run.retry" ? "failed" : "preparing") ||
-      attempt === undefined ||
-      rootNode === undefined ||
-      providerThread === undefined ||
-      preparationItem === undefined
-    ) {
-      return null;
-    }
-    return { run, attempt, rootNode, providerThread, preparationItem } as const;
-  };
+  ) =>
+    Effect.gen(function* () {
+      const run = projection.runs.find((candidate) => candidate.id === command.runId);
+      const attempt = projection.attempts.find(
+        (candidate) => candidate.id === run?.activeAttemptId,
+      );
+      const rootNode = yield* readCommandNode(command.threadId, run?.rootNodeId);
+      const providerThread = projection.providerThreads.find(
+        (candidate) => candidate.id === run?.providerThreadId,
+      );
+      const preparationItem = projection.turnItems.find(
+        (
+          candidate,
+        ): candidate is Extract<OrchestrationV2TurnItem, { readonly type: "command_execution" }> =>
+          candidate.runId === command.runId &&
+          candidate.type === "command_execution" &&
+          candidate.input === WORKSPACE_PREPARATION_INPUT,
+      );
+      if (
+        run?.status !== (command.type === "prepared-run.retry" ? "failed" : "preparing") ||
+        attempt === undefined ||
+        rootNode === undefined ||
+        providerThread === undefined ||
+        preparationItem === undefined
+      ) {
+        return null;
+      }
+      return { run, attempt, rootNode, providerThread, preparationItem } as const;
+    });
 
   const dispatchPreparedRunProgress = (
     command: Extract<OrchestrationV2Command, { readonly type: "prepared-run.progress" }>,
@@ -7993,10 +8015,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     Effect.gen(function* () {
       const projection = yield* loadProjectionForCommand(
         command,
-        ["runs", "attempts", "nodes", "providerThreads", "turnItems"],
+        ["runs", "attempts", "providerThreads", "turnItems"],
         { turnItemTypes: ["command_execution"], turnItemRunId: command.runId },
       );
-      const state = preparedRunState(command, projection);
+      const state = yield* preparedRunState(command, projection);
       if (state === null) {
         return yield* new OrchestratorDispatchError({
           commandId: command.commandId,
@@ -8031,10 +8053,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     Effect.gen(function* () {
       const projection = yield* loadProjectionForCommand(
         command,
-        ["runs", "attempts", "nodes", "providerThreads", "turnItems"],
+        ["runs", "attempts", "providerThreads", "turnItems"],
         { turnItemTypes: ["command_execution"], turnItemRunId: command.runId },
       );
-      const state = preparedRunState(command, projection);
+      const state = yield* preparedRunState(command, projection);
       if (state === null) {
         return yield* new OrchestratorDispatchError({
           commandId: command.commandId,
@@ -8119,10 +8141,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     Effect.gen(function* () {
       const projection = yield* loadProjectionForCommand(
         command,
-        ["runs", "attempts", "nodes", "providerThreads", "turnItems"],
+        ["runs", "attempts", "providerThreads", "turnItems"],
         { turnItemTypes: ["command_execution"], turnItemRunId: command.runId },
       );
-      const state = preparedRunState(command, projection);
+      const state = yield* preparedRunState(command, projection);
       if (state === null) {
         return yield* new OrchestratorDispatchError({
           commandId: command.commandId,
@@ -8222,10 +8244,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     Effect.gen(function* () {
       const projection = yield* loadProjectionForCommand(
         command,
-        ["runs", "attempts", "nodes", "providerThreads", "turnItems"],
+        ["runs", "attempts", "providerThreads", "turnItems"],
         { turnItemTypes: ["command_execution", "error"], turnItemRunId: command.runId },
       );
-      const state = preparedRunState(command, projection);
+      const state = yield* preparedRunState(command, projection);
       const failureItem = projection.turnItems.find(
         (candidate): candidate is Extract<OrchestrationV2TurnItem, { readonly type: "error" }> =>
           candidate.type === "error" &&

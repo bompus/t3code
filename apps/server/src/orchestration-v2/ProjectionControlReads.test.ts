@@ -20,6 +20,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as SqlClient from "effect/sql/SqlClient";
+import * as Tracer from "effect/Tracer";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
@@ -215,6 +216,112 @@ it.effect.each(storageCases)(
       });
       assert.isUndefined((yield* store.getRunningTurnContext(threadId)).providerTurn);
     }).pipe(Effect.provide(storeLayer)),
+);
+const traceSqlStatements = () => {
+  const statements: Array<string> = [];
+  const tracer = Tracer.make({
+    span(options) {
+      const span = new Tracer.NativeSpan(options);
+      const end = span.end.bind(span);
+      span.end = (endTime, exit) => {
+        end(endTime, exit);
+        const query = span.attributes.get("db.query.text");
+        if (typeof query === "string") statements.push(query);
+      };
+      return span;
+    },
+  });
+  return { statements, tracer };
+};
+it.effect.each(storageCases)(
+  "$storage: a node read by id returns only those nodes",
+  ({ storage, storeLayer }) =>
+    Effect.gen(function* () {
+      const store = yield* ProjectionStore.ProjectionStoreV2;
+      const now = yield* DateTime.now;
+      yield* Effect.forEach(fixtureEvents(now), (event) => store.apply(event), { discard: true });
+      const otherNodeId = NodeId.make("node:control-reads-other");
+      const nodeEvent = (id: NodeId) =>
+        ({
+          id: EventId.make(`control:${id}`),
+          type: "node.updated",
+          threadId,
+          runId,
+          nodeId: id,
+          occurredAt: now,
+          payload: {
+            id,
+            threadId,
+            runId,
+            parentNodeId: id === nodeId ? null : nodeId,
+            rootNodeId: nodeId,
+            kind: id === nodeId ? "root_turn" : "tool_call",
+            status: "completed",
+            countsForRun: false,
+            providerThreadId,
+            providerTurnId: null,
+            nativeItemRef: null,
+            runtimeRequestId: null,
+            checkpointScopeId: null,
+            startedAt: now,
+            completedAt: now,
+          },
+        }) satisfies OrchestrationV2DomainEvent;
+      yield* store.apply(nodeEvent(nodeId));
+      yield* store.apply(nodeEvent(otherNodeId));
+      const ids = (nodes: ReadonlyArray<{ readonly id: NodeId }>) =>
+        nodes.map((node) => node.id).toSorted();
+      const all = yield* store.getThreadRecords(threadId, ["nodes"]);
+      const byId = yield* store.getThreadRecords(threadId, ["nodes"], { nodeIds: [nodeId] });
+      const both = yield* store.getThreadRecords(threadId, ["nodes"], {
+        nodeIds: [otherNodeId, nodeId],
+      });
+      const none = yield* store.getThreadRecords(threadId, ["nodes"], { nodeIds: [] });
+      // An unknown node is never returned.
+      const unmatched = yield* store.getThreadRecords(threadId, ["nodes"], {
+        nodeIds: [NodeId.make("node:control-reads-unknown")],
+      });
+      assert.deepEqual(ids(all.nodes), [nodeId, otherNodeId].toSorted());
+      assert.deepEqual(ids(byId.nodes), [nodeId]);
+      assert.deepEqual(ids(both.nodes), [nodeId, otherNodeId].toSorted());
+      assert.deepEqual(ids(none.nodes), []);
+      assert.deepEqual(ids(unmatched.nodes), []);
+      if (storage === "sqlite") {
+        // Another thread's node is never returned, even when asked for by id.
+        const foreignThreadId = ThreadId.make("thread:control-reads-foreign");
+        const foreignNodeId = NodeId.make("node:control-reads-foreign");
+        yield* store.apply({
+          ...nodeEvent(foreignNodeId),
+          threadId: foreignThreadId,
+          payload: { ...nodeEvent(foreignNodeId).payload, threadId: foreignThreadId },
+        });
+        const foreign = yield* store.getThreadRecords(threadId, ["nodes"], {
+          nodeIds: [foreignNodeId],
+        });
+        assert.deepEqual(ids(foreign.nodes), []);
+        // One node is a primary-key lookup, however many nodes the thread holds.
+        const { statements, tracer } = traceSqlStatements();
+        yield* store
+          .getThreadRecords(threadId, ["nodes"], { nodeIds: [nodeId] })
+          .pipe(Effect.withTracer(tracer));
+        const nodeStatement = statements.find(
+          (statement) =>
+            statement.includes("payload_json") &&
+            statement.includes("orchestration_v2_projection_nodes") &&
+            statement.includes("node_id IN"),
+        );
+        assert.isDefined(nodeStatement);
+        const plan = yield* (yield* SqlClient.SqlClient).unsafe<{ readonly detail: string }>(
+          `EXPLAIN QUERY PLAN ${nodeStatement}`,
+        );
+        assert.deepEqual(
+          plan.map((row) => row.detail).filter((detail) => detail.startsWith("SEARCH ")),
+          [
+            "SEARCH orchestration_v2_projection_nodes USING INDEX sqlite_autoindex_orchestration_v2_projection_nodes_1 (node_id=?)",
+          ],
+        );
+      }
+    }).pipe(Effect.provide(Layer.merge(storeLayer, SqlitePersistence.layerMemory))),
 );
 it.effect.each(storageCases)(
   "$storage: controls and replies read only their exact durable targets",

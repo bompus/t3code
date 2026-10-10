@@ -302,6 +302,8 @@ export interface ProjectionRecordFilter {
   readonly runIds?: ReadonlyArray<RunId>;
   readonly turnItemTypes?: ReadonlyArray<OrchestrationV2TurnItem["type"]>;
   readonly turnItemStatuses?: ReadonlyArray<OrchestrationV2TurnItem["status"]>;
+  /** Reads only these nodes, for a command that looks a node up by id. */
+  readonly nodeIds?: ReadonlyArray<NodeId>;
 }
 export type ProjectionRecordField = Exclude<
   keyof OrchestrationV2ThreadProjection,
@@ -3000,7 +3002,17 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           fields !== undefined && !fields.includes("nodes")
             ? Effect.succeed([])
             : window === undefined
-              ? sql<PayloadRow>`
+              ? filter?.nodeIds !== undefined
+                ? filter.nodeIds.length === 0
+                  ? Effect.succeed([])
+                  : // A literal ID list makes SQLite look each node up by primary key.
+                    sql<PayloadRow>`
+            SELECT payload_json
+            FROM orchestration_v2_projection_nodes
+            WHERE thread_id = ${threadId} AND node_id IN ${sql.in(filter.nodeIds)}
+            ORDER BY COALESCE(started_at, ''), node_id ASC
+              `
+                : sql<PayloadRow>`
             SELECT payload_json
             FROM orchestration_v2_projection_nodes
             WHERE thread_id = ${threadId}
@@ -6274,6 +6286,10 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
               filter?.runIds === undefined
                 ? projection.runs
                 : projection.runs.filter((row) => filter.runIds!.includes(row.id)),
+            nodes:
+              filter?.nodeIds === undefined
+                ? projection.nodes
+                : projection.nodes.filter((node) => filter.nodeIds!.includes(node.id)),
             turnItems: projection.turnItems.filter(
               (row) =>
                 (filter?.turnItemRunIds === undefined ||
