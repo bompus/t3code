@@ -1,3 +1,7 @@
+// @effect-diagnostics nodeBuiltinImport:off - Fixtures use the same Windows
+// OSCrypt AES-256-GCM primitives Electron safeStorage writes.
+import * as NodeCrypto from "node:crypto";
+
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import { ConnectionCatalogDocument } from "@t3tools/client-runtime/platform";
@@ -17,6 +21,7 @@ import * as DesktopSavedEnvironments from "../settings/DesktopSavedEnvironments.
 import * as DesktopConfig from "./DesktopConfig.ts";
 import * as DesktopConnectionCatalogStore from "./DesktopConnectionCatalogStore.ts";
 import * as DesktopEnvironment from "./DesktopEnvironment.ts";
+import * as DesktopWindowsSafeStorage from "./DesktopWindowsSafeStorage.ts";
 
 const textDecoder = new TextDecoder();
 const textEncoder = new TextEncoder();
@@ -50,16 +55,37 @@ function layerSafeStorageFor(available: boolean, failDecrypt: Ref.Ref<boolean> |
   } satisfies ElectronSafeStorage.ElectronSafeStorage["Service"]);
 }
 
+const layerWindowsSafeStorageUnavailable = Layer.succeed(
+  DesktopWindowsSafeStorage.DesktopWindowsSafeStorage,
+  {
+    readProfileKey: (localStatePath) =>
+      Effect.fail(
+        new DesktopWindowsSafeStorage.DesktopWindowsSafeStorageError({
+          localStatePath,
+          cause: new Error("no Windows profile keys in this test"),
+        }),
+      ),
+  } satisfies DesktopWindowsSafeStorage.DesktopWindowsSafeStorage["Service"],
+);
+
+interface LayerOverrides {
+  readonly platform?: NodeJS.Platform;
+  readonly appDataDirectory?: string;
+  readonly safeStorage?: Layer.Layer<ElectronSafeStorage.ElectronSafeStorage>;
+  readonly windowsSafeStorage?: Layer.Layer<DesktopWindowsSafeStorage.DesktopWindowsSafeStorage>;
+}
+
 function layerFor(
   baseDir: string,
   encryptionAvailable = true,
   failDecrypt: Ref.Ref<boolean> | null = null,
   fileSystemLayer: Layer.Layer<FileSystem.FileSystem> = NodeServices.layer,
+  overrides: LayerOverrides = {},
 ) {
   const layerEnvironment = DesktopEnvironment.layer({
     dirname: "/repo/apps/desktop/src",
     homeDirectory: baseDir,
-    platform: "darwin",
+    platform: overrides.platform ?? "darwin",
     processArch: "arm64",
     appVersion: "1.2.3",
     appPath: "/repo",
@@ -68,13 +94,21 @@ function layerFor(
     runningUnderArm64Translation: false,
   }).pipe(
     Layer.provide(
-      Layer.mergeAll(NodeServices.layer, DesktopConfig.layerTest({ T3CODE_HOME: baseDir })),
+      Layer.mergeAll(
+        NodeServices.layer,
+        DesktopConfig.layerTest({
+          T3CODE_HOME: baseDir,
+          APPDATA: overrides.appDataDirectory,
+        }),
+      ),
     ),
   );
-  const layerSafeStorage = layerSafeStorageFor(encryptionAvailable, failDecrypt);
+  const layerSafeStorage =
+    overrides.safeStorage ?? layerSafeStorageFor(encryptionAvailable, failDecrypt);
   const layerDependencies = Layer.mergeAll(
     layerEnvironment,
     layerSafeStorage,
+    overrides.windowsSafeStorage ?? layerWindowsSafeStorageUnavailable,
     NodeServices.layer,
     fileSystemLayer,
   );
@@ -439,5 +473,226 @@ describe("DesktopConnectionCatalogStore", () => {
       yield* Ref.set(failDecrypt, false);
       assert.deepStrictEqual(yield* store.get, Option.some('{"schemaVersion":1,"targets":[]}'));
     }).pipe(Effect.provide(NodeServices.layer), Effect.scoped),
+  );
+});
+
+// Windows V1/V2 profiles share one catalog file but can hold different
+// safeStorage keys. These fixtures use the real `v10` AES-256-GCM format
+// Electron writes on Windows, with three distinct profile keys.
+const stableProfileKey = Buffer.alloc(32, 1);
+const alphaProfileKey = Buffer.alloc(32, 2);
+const v2ProfileKey = Buffer.alloc(32, 3);
+const unknownProfileKey = Buffer.alloc(32, 4);
+
+const encryptWindowsV10 = (value: string, key: Buffer): Buffer => {
+  const nonce = NodeCrypto.randomBytes(12);
+  const cipher = NodeCrypto.createCipheriv("aes-256-gcm", key, nonce);
+  const ciphertext = Buffer.concat([cipher.update(value, "utf8"), cipher.final()]);
+  return Buffer.concat([Buffer.from("v10"), nonce, ciphertext, cipher.getAuthTag()]);
+};
+
+const decryptWindowsV10 = (value: Uint8Array, key: Buffer): string | null => {
+  const buffer = Buffer.from(value);
+  if (buffer.subarray(0, 3).toString("latin1") !== "v10" || buffer.length < 3 + 12 + 16) {
+    return null;
+  }
+  try {
+    const decipher = NodeCrypto.createDecipheriv("aes-256-gcm", key, buffer.subarray(3, 15));
+    decipher.setAuthTag(buffer.subarray(-16));
+    return Buffer.concat([decipher.update(buffer.subarray(15, -16)), decipher.final()]).toString(
+      "utf8",
+    );
+  } catch {
+    return null;
+  }
+};
+
+const layerWindowsSafeStorageAsV2 = Layer.succeed(ElectronSafeStorage.ElectronSafeStorage, {
+  isEncryptionAvailable: Effect.succeed(true),
+  encryptString: (value) => Effect.succeed(encryptWindowsV10(value, v2ProfileKey)),
+  decryptString: (value) => {
+    const decrypted = decryptWindowsV10(value, v2ProfileKey);
+    return decrypted === null
+      ? Effect.fail(
+          new ElectronSafeStorage.ElectronSafeStorageDecryptError({
+            cause: new Error("Error while decrypting the ciphertext"),
+          }),
+        )
+      : Effect.succeed(decrypted);
+  },
+  selectedStorageBackend: Effect.succeedNone,
+} satisfies ElectronSafeStorage.ElectronSafeStorage["Service"]);
+
+const layerWindowsProfileKeys = (keys: Readonly<Record<string, Buffer>>, calls: Array<string>) =>
+  Layer.succeed(DesktopWindowsSafeStorage.DesktopWindowsSafeStorage, {
+    readProfileKey: (localStatePath) => {
+      calls.push(localStatePath);
+      const profile = localStatePath.includes("T3 Code (Alpha)")
+        ? "T3 Code (Alpha)"
+        : localStatePath.includes("t3code")
+          ? "t3code"
+          : undefined;
+      const key = profile === undefined ? undefined : keys[profile];
+      return key === undefined
+        ? Effect.fail(
+            new DesktopWindowsSafeStorage.DesktopWindowsSafeStorageError({
+              localStatePath,
+              cause: new Error("no such profile"),
+            }),
+          )
+        : Effect.succeed(new Uint8Array(key));
+    },
+  } satisfies DesktopWindowsSafeStorage.DesktopWindowsSafeStorage["Service"]);
+
+const withWindowsStore = <A, E, R>(
+  catalogKey: Buffer,
+  effect: (context: {
+    readonly catalogPath: string;
+    readonly appDataDirectory: string;
+    readonly profileKeyCalls: ReadonlyArray<string>;
+  }) => Effect.Effect<A, E, R | DesktopConnectionCatalogStore.DesktopConnectionCatalogStore>,
+) =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const baseDir = yield* fileSystem.makeTempDirectoryScoped({
+      prefix: "t3-desktop-connection-catalog-windows-",
+    });
+    const appDataDirectory = path.join(baseDir, "appdata");
+    const catalogPath = path.join(baseDir, "userdata", "connection-catalog.json");
+    const catalog = '{"schemaVersion":1,"targets":[{"label":"saved"}]}';
+    for (const profile of ["t3code", "T3 Code (Alpha)", "t3code-v2"]) {
+      yield* fileSystem.makeDirectory(path.join(appDataDirectory, profile), {
+        recursive: true,
+      });
+      yield* fileSystem.writeFileString(
+        path.join(appDataDirectory, profile, "Local State"),
+        `{"os_crypt":{"encrypted_key":"wrapped-${profile}"}}`,
+      );
+    }
+    yield* fileSystem.makeDirectory(path.join(baseDir, "userdata"), { recursive: true });
+    yield* fileSystem.writeFileString(
+      catalogPath,
+      `{"version":1,"encryptedCatalog":"${Base64.encode(encryptWindowsV10(catalog, catalogKey))}"}\n`,
+    );
+    const profileKeyCalls: Array<string> = [];
+    const layer = layerFor(baseDir, true, null, NodeServices.layer, {
+      platform: "win32",
+      appDataDirectory,
+      safeStorage: layerWindowsSafeStorageAsV2,
+      windowsSafeStorage: layerWindowsProfileKeys(
+        { t3code: stableProfileKey, "T3 Code (Alpha)": alphaProfileKey },
+        profileKeyCalls,
+      ),
+    });
+    const result = yield* effect({ catalogPath, appDataDirectory, profileKeyCalls }).pipe(
+      Effect.provide(layer),
+    );
+    return { result, catalog };
+  }).pipe(Effect.provide(NodeServices.layer), Effect.scoped);
+
+describe("DesktopConnectionCatalogStore Windows profile key recovery", () => {
+  it.effect.each(["t3code", "T3 Code (Alpha)"] as const)(
+    "recovers a catalog encrypted with the %s key without touching any profile",
+    (profile) =>
+      withWindowsStore(
+        profile === "t3code" ? stableProfileKey : alphaProfileKey,
+        ({ catalogPath, appDataDirectory }) =>
+          Effect.gen(function* () {
+            const fileSystem = yield* FileSystem.FileSystem;
+            const path = yield* Path.Path;
+            const store = yield* DesktopConnectionCatalogStore.DesktopConnectionCatalogStore;
+            const before = yield* fileSystem.readFileString(catalogPath);
+
+            const recovered = yield* store.get;
+            assert.deepStrictEqual(
+              recovered,
+              Option.some('{"schemaVersion":1,"targets":[{"label":"saved"}]}'),
+            );
+
+            // Recovery is read-only: the shared catalog and every profile's
+            // Local State stay byte-identical, so V1 and any credentials V2
+            // already encrypted with its own key keep working.
+            assert.equal(yield* fileSystem.readFileString(catalogPath), before);
+            for (const profile of ["t3code", "T3 Code (Alpha)", "t3code-v2"]) {
+              assert.equal(
+                yield* fileSystem.readFileString(
+                  path.join(appDataDirectory, profile, "Local State"),
+                ),
+                `{"os_crypt":{"encrypted_key":"wrapped-${profile}"}}`,
+              );
+            }
+          }),
+      ),
+  );
+
+  it.effect("keeps recovered catalog writes readable by the legacy (V1) profile", () =>
+    withWindowsStore(stableProfileKey, ({ catalogPath }) =>
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const store = yield* DesktopConnectionCatalogStore.DesktopConnectionCatalogStore;
+        const updated = '{"schemaVersion":1,"targets":[{"label":"updated"}]}';
+
+        // Even when set runs before any get, the existing catalog's key is
+        // resolved first so the rewrite stays decryptable by V1's profile.
+        assert.isTrue(yield* store.set(updated));
+        const written = JSON.parse(yield* fileSystem.readFileString(catalogPath)) as {
+          encryptedCatalog: string;
+        };
+        const writtenBytes = Buffer.from(written.encryptedCatalog, "base64");
+        assert.equal(decryptWindowsV10(writtenBytes, stableProfileKey), updated);
+        assert.isNull(decryptWindowsV10(writtenBytes, v2ProfileKey));
+        assert.deepStrictEqual(yield* store.get, Option.some(updated));
+      }),
+    ),
+  );
+
+  it.effect("leaves a catalog encrypted with the current V2 key on safeStorage", () =>
+    withWindowsStore(v2ProfileKey, ({ catalogPath, profileKeyCalls }) =>
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const store = yield* DesktopConnectionCatalogStore.DesktopConnectionCatalogStore;
+        const updated = '{"schemaVersion":1,"targets":[]}';
+
+        assert.deepStrictEqual(
+          yield* store.get,
+          Option.some('{"schemaVersion":1,"targets":[{"label":"saved"}]}'),
+        );
+        assert.isTrue(yield* store.set(updated));
+        const written = JSON.parse(yield* fileSystem.readFileString(catalogPath)) as {
+          encryptedCatalog: string;
+        };
+        assert.equal(
+          decryptWindowsV10(Buffer.from(written.encryptedCatalog, "base64"), v2ProfileKey),
+          updated,
+        );
+        // A working V2 key never triggers legacy key recovery.
+        assert.deepEqual([...profileKeyCalls], []);
+      }),
+    ),
+  );
+
+  it.effect("fails closed without overwriting a catalog no profile key can open", () =>
+    withWindowsStore(unknownProfileKey, ({ catalogPath }) =>
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const store = yield* DesktopConnectionCatalogStore.DesktopConnectionCatalogStore;
+        const before = yield* fileSystem.readFileString(catalogPath);
+
+        const getError = yield* store.get.pipe(Effect.flip);
+        assert.instanceOf(
+          getError,
+          DesktopConnectionCatalogStore.DesktopConnectionCatalogStoreProtectionError,
+        );
+        assert.equal(getError.operation, "decrypt-catalog");
+
+        const setError = yield* store.set('{"schemaVersion":1,"targets":[]}').pipe(Effect.flip);
+        assert.instanceOf(
+          setError,
+          DesktopConnectionCatalogStore.DesktopConnectionCatalogStoreProtectionError,
+        );
+        assert.equal(yield* fileSystem.readFileString(catalogPath), before);
+      }),
+    ),
   );
 });

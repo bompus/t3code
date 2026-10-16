@@ -38,6 +38,7 @@ import * as DesktopAppActivation from "./app/DesktopAppActivation.ts";
 import * as DesktopWebLinks from "./app/DesktopWebLinks.ts";
 import * as DesktopAppIdentity from "./app/DesktopAppIdentity.ts";
 import * as DesktopConnectionCatalogStore from "./app/DesktopConnectionCatalogStore.ts";
+import * as DesktopWindowsSafeStorage from "./app/DesktopWindowsSafeStorage.ts";
 import * as DesktopClerk from "./app/DesktopClerk.ts";
 import * as DesktopCliCommand from "./app/DesktopCliCommand.ts";
 import * as DesktopApplicationMenu from "./window/DesktopApplicationMenu.ts";
@@ -149,7 +150,10 @@ const layerDesktopFoundation = Layer.mergeAll(
   DesktopLegacyLocalStorage.layer,
   DesktopAppSettings.layer,
   DesktopClientSettings.layer,
-  DesktopConnectionCatalogStore.layer.pipe(Layer.provideMerge(DesktopSavedEnvironments.layer)),
+  DesktopConnectionCatalogStore.layer.pipe(
+    Layer.provideMerge(DesktopSavedEnvironments.layer),
+    Layer.provideMerge(DesktopWindowsSafeStorage.layer),
+  ),
   DesktopAssets.layer,
   DesktopObservability.layer,
   DesktopRendererHistory.layer,

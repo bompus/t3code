@@ -20,11 +20,13 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 
 import * as ElectronSafeStorage from "../electron/ElectronSafeStorage.ts";
 import * as DesktopSavedEnvironments from "../settings/DesktopSavedEnvironments.ts";
 import * as DesktopEnvironment from "./DesktopEnvironment.ts";
+import * as DesktopWindowsSafeStorage from "./DesktopWindowsSafeStorage.ts";
 
 const EncryptedConnectionCatalogDocument = Schema.Struct({
   version: Schema.Literal(1),
@@ -145,6 +147,8 @@ export class DesktopConnectionCatalogStoreProtectionError extends Schema.TaggedE
     return `Desktop connection catalog protection failed during ${this.operation} at ${this.catalogPath}.`;
   }
 }
+
+const isProtectionError = Schema.is(DesktopConnectionCatalogStoreProtectionError);
 
 export class DesktopConnectionCatalogStore extends Context.Service<
   DesktopConnectionCatalogStore,
@@ -376,15 +380,39 @@ const migrateSavedEnvironmentRecords = Effect.fn(
   };
 });
 
+/**
+ * Which key encrypts the shared catalog, resolved from the catalog itself.
+ * `Legacy` means a Windows V1 profile key opened a catalog the running
+ * V2 profile key could not; writes then keep that key so V1 can still read
+ * the file, and no profile's `Local State` is ever rewritten.
+ */
+type CatalogKeyState =
+  | { readonly _tag: "Unresolved" }
+  | { readonly _tag: "Current" }
+  | { readonly _tag: "Legacy"; readonly profile: string; readonly key: Uint8Array }
+  | { readonly _tag: "Unrecoverable"; readonly encryptedCatalog: string };
+
 /** @public Service construction is part of the canonical Effect module API. */
 export const make = Effect.gen(function* () {
   const environment = yield* DesktopEnvironment.DesktopEnvironment;
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const safeStorage = yield* ElectronSafeStorage.ElectronSafeStorage;
+  const windowsSafeStorage = yield* DesktopWindowsSafeStorage.DesktopWindowsSafeStorage;
   const crypto = yield* Crypto.Crypto;
   const savedEnvironments = yield* DesktopSavedEnvironments.DesktopSavedEnvironments;
   const catalogPath = path.join(environment.stateDir, "connection-catalog.json");
+  const catalogKeyState = yield* Ref.make<CatalogKeyState>({ _tag: "Unresolved" });
+  // Windows V1 profiles whose safeStorage key may have encrypted the
+  // shared catalog before the V2 profile existed. Both names can coexist
+  // with different keys, so recovery tries each against the catalog.
+  const legacyProfileCandidates =
+    environment.platform === "win32" && !environment.isDevelopment
+      ? ["t3code", "T3 Code (Alpha)"].map((profile) => ({
+          profile,
+          localStatePath: path.join(environment.appDataDirectory, profile, "Local State"),
+        }))
+      : [];
   const encryptionAvailable = safeStorage.isEncryptionAvailable.pipe(
     Effect.mapError(
       (cause) =>
@@ -396,21 +424,9 @@ export const make = Effect.gen(function* () {
     ),
   );
 
-  const writeCatalog = Effect.fn("desktop.connectionCatalogStore.writeCatalog")(function* (
-    catalog: string,
-  ) {
-    const encryptedCatalog = Base64.encode(
-      yield* safeStorage.encryptString(catalog).pipe(
-        Effect.mapError(
-          (cause) =>
-            new DesktopConnectionCatalogStoreProtectionError({
-              operation: "encrypt-catalog",
-              catalogPath,
-              cause,
-            }),
-        ),
-      ),
-    );
+  const persistEncryptedCatalog = Effect.fn(
+    "desktop.connectionCatalogStore.persistEncryptedCatalog",
+  )(function* (encrypted: Uint8Array) {
     const suffix = (yield* crypto.randomUUIDv4().pipe(
       Effect.mapError(
         (cause) =>
@@ -425,9 +441,99 @@ export const make = Effect.gen(function* () {
       fileSystem,
       path,
       catalogPath,
-      document: { version: 1, encryptedCatalog },
+      document: { version: 1, encryptedCatalog: Base64.encode(encrypted) },
       suffix,
     });
+  });
+
+  const writeCatalog = Effect.fn("desktop.connectionCatalogStore.writeCatalog")(function* (
+    catalog: string,
+  ) {
+    yield* persistEncryptedCatalog(
+      yield* safeStorage.encryptString(catalog).pipe(
+        Effect.mapError(
+          (cause) =>
+            new DesktopConnectionCatalogStoreProtectionError({
+              operation: "encrypt-catalog",
+              catalogPath,
+              cause,
+            }),
+        ),
+      ),
+    );
+  });
+
+  const decryptProtectionError = (cause: unknown) =>
+    new DesktopConnectionCatalogStoreProtectionError({
+      operation: "decrypt-catalog",
+      catalogPath,
+      cause,
+    });
+
+  const recoverWithLegacyProfileKey = Effect.fn(
+    "desktop.connectionCatalogStore.recoverWithLegacyProfileKey",
+  )(function* (encryptedCatalog: Uint8Array, encodedCatalog: string, cause: unknown) {
+    const state = yield* Ref.get(catalogKeyState);
+    if (
+      legacyProfileCandidates.length === 0 ||
+      (state._tag === "Unrecoverable" && state.encryptedCatalog === encodedCatalog)
+    ) {
+      return yield* decryptProtectionError(cause);
+    }
+    for (const candidate of legacyProfileCandidates) {
+      const key = yield* windowsSafeStorage.readProfileKey(candidate.localStatePath).pipe(
+        Effect.asSome,
+        Effect.catch((error) =>
+          Effect.logWarning("Could not read a legacy Windows profile key for catalog recovery.", {
+            profile: candidate.profile,
+            error,
+          }).pipe(Effect.as(Option.none<Uint8Array>())),
+        ),
+      );
+      if (Option.isNone(key)) continue;
+      const decrypted = DesktopWindowsSafeStorage.decryptWithProfileKey(
+        key.value,
+        encryptedCatalog,
+      );
+      if (Option.isNone(decrypted)) continue;
+      yield* Ref.set(catalogKeyState, {
+        _tag: "Legacy",
+        profile: candidate.profile,
+        key: key.value,
+      });
+      yield* Effect.logWarning(
+        "Recovered the connection catalog with a legacy Windows profile key.",
+        { profile: candidate.profile, catalogPath },
+      );
+      return decrypted.value;
+    }
+    yield* Ref.set(catalogKeyState, { _tag: "Unrecoverable", encryptedCatalog: encodedCatalog });
+    return yield* decryptProtectionError(cause);
+  });
+
+  const decryptCatalog = Effect.fn("desktop.connectionCatalogStore.decryptCatalog")(function* (
+    document: EncryptedConnectionCatalogDocument,
+  ) {
+    const encryptedCatalog = yield* decodeSecretBytes(catalogPath, document.encryptedCatalog);
+    const state = yield* Ref.get(catalogKeyState);
+    if (state._tag === "Legacy") {
+      const decrypted = DesktopWindowsSafeStorage.decryptWithProfileKey(
+        state.key,
+        encryptedCatalog,
+      );
+      if (Option.isSome(decrypted)) {
+        return decrypted.value;
+      }
+      // The catalog was rewritten under another key since recovery (for
+      // example by V1 after its own profile changed); resolve it again.
+      yield* Ref.set(catalogKeyState, { _tag: "Unresolved" });
+    }
+    return yield* safeStorage.decryptString(encryptedCatalog).pipe(
+      Effect.tap(() => Ref.set(catalogKeyState, { _tag: "Current" })),
+      Effect.catch((cause) =>
+        recoverWithLegacyProfileKey(encryptedCatalog, document.encryptedCatalog, cause),
+      ),
+    );
   });
 
   const migrateLegacyCatalog = Effect.gen(function* () {
@@ -480,25 +586,41 @@ export const make = Effect.gen(function* () {
       if (!(yield* encryptionAvailable)) {
         return Option.none<string>();
       }
-      const decrypted = yield* decodeSecretBytes(catalogPath, document.value.encryptedCatalog).pipe(
-        Effect.flatMap((encryptedCatalog) =>
-          safeStorage.decryptString(encryptedCatalog).pipe(
-            Effect.mapError(
-              (cause) =>
-                new DesktopConnectionCatalogStoreProtectionError({
-                  operation: "decrypt-catalog",
-                  catalogPath,
-                  cause,
-                }),
-            ),
-          ),
-        ),
-      );
-      return Option.some(decrypted);
+      return Option.some(yield* decryptCatalog(document.value));
     }).pipe(Effect.withSpan("desktop.connectionCatalogStore.get")),
     set: Effect.fn("desktop.connectionCatalogStore.set")(function* (catalog) {
       if (!(yield* encryptionAvailable)) {
         return false;
+      }
+      const state = yield* Ref.get(catalogKeyState);
+      if (state._tag === "Legacy") {
+        yield* persistEncryptedCatalog(
+          DesktopWindowsSafeStorage.encryptWithProfileKey(state.key, catalog),
+        );
+        return true;
+      }
+      if (state._tag !== "Current" && legacyProfileCandidates.length > 0) {
+        // Resolve the existing catalog's key before rewriting it, so a
+        // catalog V1 encrypted is never silently re-encrypted under a key
+        // V1 cannot read, and an undecryptable catalog is never silently
+        // overwritten. A missing catalog keeps the current key.
+        const document = yield* readDocument(fileSystem, catalogPath).pipe(
+          Effect.mapError((cause) => decryptProtectionError(cause)),
+        );
+        if (Option.isSome(document)) {
+          yield* decryptCatalog(document.value).pipe(
+            Effect.mapError((cause) =>
+              isProtectionError(cause) ? cause : decryptProtectionError(cause),
+            ),
+          );
+          const resolved = yield* Ref.get(catalogKeyState);
+          if (resolved._tag === "Legacy") {
+            yield* persistEncryptedCatalog(
+              DesktopWindowsSafeStorage.encryptWithProfileKey(resolved.key, catalog),
+            );
+            return true;
+          }
+        }
       }
       yield* writeCatalog(catalog);
       return true;

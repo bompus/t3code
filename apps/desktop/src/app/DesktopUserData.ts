@@ -59,11 +59,19 @@ export const resolveUserDataPath = Effect.fn("desktop.userData.resolveUserDataPa
     // Chromium databases require their own profile for each running version.
     if (input.platform !== "win32") return destinationPath;
     const destinationState = path.join(destinationPath, "Local State");
+    // An existing V2 profile may already hold credentials encrypted with
+    // its own key, so it is never reseeded; a catalog its key cannot open
+    // is recovered by DesktopConnectionCatalogStore instead.
     if (yield* inspect(destinationState)) return destinationPath;
     const legacyState = path.join(legacyPath, "Local State");
-    const sourceState = (yield* inspect(legacyState))
-      ? legacyState
-      : path.join(input.appDataDirectory, "t3code", "Local State");
+    // Stable V1 builds read their safeStorage key from `t3code`; the Alpha
+    // profile predates that name and is stale on installs that have both.
+    // Prefer the key V1 actually encrypts the shared connection catalog
+    // with, and fall back to Alpha only when it is the sole legacy profile.
+    // Catalogs encrypted with the other candidate are recovered at read
+    // time by DesktopConnectionCatalogStore.
+    const stableState = path.join(input.appDataDirectory, "t3code", "Local State");
+    const sourceState = (yield* inspect(stableState)) ? stableState : legacyState;
     if (!(yield* inspect(sourceState))) return destinationPath;
     // Windows safeStorage keys live here. Copy only these preferences, never locked databases.
     const state = yield* fs

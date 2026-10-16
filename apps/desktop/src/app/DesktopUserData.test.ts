@@ -37,6 +37,38 @@ it.effect("identifies a failed source read and preserves its cause", () => {
   );
 });
 
+it.effect("prefers the stable t3code profile key when both Windows legacy profiles exist", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-v2-profile-" });
+    const stableState = '{"os_crypt":{"encrypted_key":"stable-key"}}';
+    const alphaState = '{"os_crypt":{"encrypted_key":"alpha-key"}}';
+    yield* fs.makeDirectory(path.join(directory, "t3code"), { recursive: true });
+    yield* fs.makeDirectory(path.join(directory, "T3 Code (Alpha)"), { recursive: true });
+    yield* fs.writeFileString(path.join(directory, "t3code", "Local State"), stableState);
+    yield* fs.writeFileString(path.join(directory, "T3 Code (Alpha)", "Local State"), alphaState);
+    yield* resolveUserDataPath({
+      appDataDirectory: directory,
+      isDevelopment: false,
+      platform: "win32",
+    });
+    assert.equal(
+      yield* fs.readFileString(path.join(directory, "t3code-v2", "Local State")),
+      stableState,
+    );
+    // Neither legacy profile is modified by seeding.
+    assert.equal(
+      yield* fs.readFileString(path.join(directory, "t3code", "Local State")),
+      stableState,
+    );
+    assert.equal(
+      yield* fs.readFileString(path.join(directory, "T3 Code (Alpha)", "Local State")),
+      alphaState,
+    );
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
 it.effect.each(["t3code", "T3 Code (Alpha)"])(
   "preserves Windows credential keys from %s without copying browser databases",
   (sourceName) =>
