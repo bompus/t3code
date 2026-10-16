@@ -15,4 +15,4 @@ programs keep these navigation keys.
 To copy all retained output, choose Select all in the terminal's context menu,
 then copy. Cmd+A on macOS and Ctrl+Shift+A elsewhere select the same output.
 Ctrl+A still moves to the beginning of shell input on Windows and Linux.
-Choose Jump to latest in the context menu to return to the current output.
+Choose Jump to latest in the terminal's context menu to return to the current output.
