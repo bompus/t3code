@@ -11,6 +11,7 @@ export default defineConfig((ctx) => ({
     allow_author_approval: !isGated(ctx),
     auto_review: {
       enabled: true,
+      base_branches: ["^mirror/upstream-main$"],
     },
     pre_merge_checks: {
       docstrings: { mode: "off" },
