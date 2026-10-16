@@ -420,6 +420,9 @@ const config: ExpoConfig = {
       {
         android: {
           minSdkVersion: 24,
+          // React Native stores the Hermes bundle uncompressed so it can be memory-mapped.
+          // Compressing it makes the release APK about 13 MB smaller.
+          enableBundleCompression: true,
           // kotlinx-io uses Kotlin 2.3's return-value checker annotation, while
           // SDK 58 builds with Kotlin 2.2. It has no runtime behavior.
           // WorkManager 2.9 keeps InputMerger classes but not their constructors,
