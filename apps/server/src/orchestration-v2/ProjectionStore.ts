@@ -5072,12 +5072,17 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 .filter((row) => !row.synthetic)
                 .map((row) => ({ threadId: row.sourceThreadId, id: row.sourceItemId })),
             );
+            // The wire projection drops the diffs of file changes that did not fail, so the
+            // page does not read them.
             const payloads = yield* sql<{
               thread_id: string;
               turn_item_id: string;
               payload_json: string;
             }>`
-          SELECT item.thread_id, item.turn_item_id, item.payload_json
+          SELECT item.thread_id, item.turn_item_id,
+            CASE WHEN item.type = 'file_change' AND item.status <> 'failed'
+              THEN json_remove(item.payload_json, '$.diffStr', '$.oldStr', '$.newStr')
+              ELSE item.payload_json END AS payload_json
           FROM orchestration_v2_projection_turn_items item JOIN json_each(${sources}) wanted
           ON item.thread_id = json_extract(wanted.value, '$.threadId')
             AND item.turn_item_id = json_extract(wanted.value, '$.id')`;

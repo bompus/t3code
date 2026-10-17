@@ -1004,6 +1004,59 @@ describe("V2 history materialization", () => {
     }).pipe(Effect.provide(layerTest)),
   );
 
+  it.effect("reads the same wire items for file changes without loading their diffs", () =>
+    Effect.gen(function* () {
+      const projection = yield* setup;
+      const fileChange = (
+        id: string,
+        ordinal: number,
+        status: "completed" | "failed",
+        diff: Partial<{ diffStr: string; oldStr: string; newStr: string }>,
+      ) => ({
+        ...item(id, ordinal, ""),
+        type: "file_change" as const,
+        fileName: "a.ts",
+        status,
+        ...diff,
+      });
+      const big = "x".repeat(100_000);
+      const items = [
+        fileChange("completed", 0, "completed", { diffStr: big, oldStr: big, newStr: big }),
+        fileChange("failed", 1, "failed", { diffStr: big, oldStr: big, newStr: big }),
+        fileChange("failed-blank", 2, "failed", { diffStr: "   ", newStr: big }),
+        fileChange("failed-without-diff", 3, "failed", { oldStr: big }),
+        fileChange("no-diff", 4, "completed", {}),
+      ];
+      yield* putItems(items);
+      const snapshot = yield* projection.getThreadSnapshot(threadId);
+      const rows = snapshot.projection.visibleTurnItems.map((row) => ({
+        ...row,
+        item: projectTurnItemForWire(row.item),
+      }));
+      const cursor = encodeThreadHistoryCursor({
+        snapshotSequence: snapshot.snapshotSequence,
+        sourceThreadId: threadId,
+        sourceItemId: "absent",
+        position: rows.length,
+      });
+      const page = yield* projection.getThreadHistoryPage(threadId, cursor);
+      assert.deepEqual(page, {
+        snapshotSequence: snapshot.snapshotSequence,
+        ...selectHistoryPageFromCursor({
+          items: rows,
+          cursor,
+          snapshotSequence: snapshot.snapshotSequence,
+        }),
+      });
+      const diffOf = (id: string) => {
+        const wire = page.items.find((row) => row.sourceItemId === id)?.item;
+        return wire?.type === "file_change" ? wire.diffStr : undefined;
+      };
+      assert.equal(diffOf("completed"), undefined);
+      assert.equal(diffOf("failed")?.length, 32_768 + "\n… output truncated for transport".length);
+    }).pipe(Effect.provide(layerTest)),
+  );
+
   it.effect("keeps cached timeline reads current as the thread and its fork source change", () =>
     Effect.gen(function* () {
       const projection = yield* setup;
