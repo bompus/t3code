@@ -187,6 +187,39 @@ describe("browser API CORS", () => {
 
 const layerFileResponse = Layer.mergeAll(NodeHttpPlatform.layer, NodeServices.layer);
 
+it.effect("compresses buffered JSON responses with the codec the client prefers", () =>
+  Effect.gen(function* () {
+    const body = JSON.stringify({ value: "compressible".repeat(1_000) });
+    const layerApp = Layer.merge(
+      HttpRouter.add(
+        "GET",
+        "/data",
+        Effect.succeed(HttpServerResponse.text(body, { contentType: "application/json" })),
+      ),
+      ServerHttp.layerHttpCompression,
+    ).pipe(Layer.provideMerge(NodeHttpPlatform.layer));
+    const services = yield* Layer.build(
+      HttpRouter.serve(layerApp, { disableListenLog: true }).pipe(
+        Layer.provideMerge(NodeHttpServer.layerTest),
+      ),
+    );
+    const client = Context.get(services, HttpClient.HttpClient);
+
+    for (const [acceptEncoding, encoding] of [
+      ["br, gzip", "br"],
+      ["gzip", "gzip"],
+      ["identity", undefined],
+    ] as const) {
+      const response = yield* client.get("/data", {
+        headers: { "accept-encoding": acceptEncoding },
+      });
+      expect(response.headers["content-encoding"]).toBe(encoding);
+      expect(response.headers["vary"]).toBe("Accept-Encoding");
+      expect(yield* response.text).toBe(body);
+    }
+  }).pipe(Effect.provide(NodeServices.layer)),
+);
+
 const makeStaticRequest = Effect.fn("HttpTest.makeStaticRequest")(function* (staticDir: string) {
   const config = yield* ServerConfig.ServerConfig;
   const fileSystem = yield* FileSystem.FileSystem;

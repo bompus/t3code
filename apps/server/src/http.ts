@@ -20,6 +20,7 @@ import {
   HttpClient,
   HttpClientResponse,
   HttpMiddleware,
+  HttpPlatform,
   HttpRouter,
   HttpServerResponse,
   HttpServerRequest,
@@ -53,6 +54,7 @@ import {
   browserApiCorsAllowedMethods,
   DESKTOP_RENDERER_ORIGINS,
 } from "./httpCors.ts";
+import { withLargeOutputChunks } from "./httpCompression.ts";
 
 const OTLP_TRACES_PROXY_PATH = "/api/observability/v1/traces";
 const LOOPBACK_HOSTNAMES = new Set(["127.0.0.1", "::1", "localhost"]);
@@ -250,9 +252,16 @@ export const assetFileResponse = Effect.fn("assetFileResponse")(function* (
   return yield* HttpServerResponse.file(asset.path, { status, offset, bytesToRead, headers });
 });
 
-export const layerHttpCompression = HttpRouter.middleware(HttpMiddleware.compression(), {
-  global: true,
-});
+export const layerHttpCompression = HttpRouter.middleware(
+  (httpApp) =>
+    HttpMiddleware.compression()(httpApp).pipe(
+      Effect.updateService(HttpPlatform.HttpPlatform, (platform) => ({
+        ...platform,
+        compression: withLargeOutputChunks(platform.compression),
+      })),
+    ),
+  { global: true },
+);
 
 export const layerBrowserApiCors = Layer.unwrap(
   Effect.gen(function* () {
