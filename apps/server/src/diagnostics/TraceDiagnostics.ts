@@ -1,3 +1,5 @@
+// @effect-diagnostics nodeBuiltinImport:off - FileSystem has no zstd decompression, so
+// compressed trace backups go through a Node zlib stream.
 import type {
   ServerTraceDiagnosticsErrorKind,
   ServerTraceDiagnosticsFailureSummary,
@@ -17,6 +19,8 @@ import * as PlatformError from "effect/PlatformError";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
+import * as NodeStream from "@effect/platform-node-shared/NodeStream";
+import * as NodeZlib from "node:zlib";
 
 interface TraceRecordLike {
   readonly name?: unknown;
@@ -377,7 +381,39 @@ export function makeTraceDiagnosticsAggregator(
 }
 
 /**
- * Succeeds with false when the file does not exist.
+ * Feeds each line of one zstd-compressed trace backup to `onLine`, streaming
+ * like the plain reader. Succeeds with false when the file does not exist.
+ */
+function readCompressedTraceFileLines(
+  fileSystem: FileSystem.FileSystem,
+  path: string,
+  onLine: (line: string) => void,
+): Effect.Effect<boolean, TraceFileReadError> {
+  return fileSystem.stream(path).pipe(
+    NodeStream.pipeThroughSimple(() => NodeZlib.createZstdDecompress()),
+    Stream.decodeText,
+    Stream.splitLines,
+    Stream.runForEachArray((lines) => Effect.sync(() => lines.forEach(onLine))),
+    Effect.as(true),
+    Effect.catch((cause) =>
+      cause._tag === "PlatformError" && isNotFoundError(cause)
+        ? Effect.succeed(false)
+        : Effect.fail(
+            new TraceFileReadError({
+              traceFilePath: path,
+              causeTag: cause._tag === "PlatformError" ? cause.reason._tag : "ZstdDecompress",
+              cause,
+            }),
+          ),
+    ),
+  );
+}
+
+/**
+ * Feeds each line of one trace file to `onLine`, streaming so only one chunk of
+ * text is in memory at a time. A rotated backup may have been compressed to
+ * `<path>.zst`, which is read when the plain file is missing. Succeeds with
+ * false when neither exists.
  */
 export function streamTraceFileLines(
   fileSystem: FileSystem.FileSystem,
@@ -392,7 +428,7 @@ export function streamTraceFileLines(
     Effect.catchTags({
       PlatformError: (cause) =>
         isNotFoundError(cause)
-          ? Effect.succeed(false)
+          ? readCompressedTraceFileLines(fileSystem, `${path}.zst`, onLine)
           : Effect.fail(
               new TraceFileReadError({
                 traceFilePath: path,

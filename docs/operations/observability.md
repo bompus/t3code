@@ -72,7 +72,8 @@ request.
 #### Summarize the trace file
 
 `t3 trace summary` reads the trace file and its rotated backups directly, so it works while the
-server is stalled or stopped. It prints counts, rates, and latency percentiles per span name. Use
+server is stalled or stopped. Backups older than the newest are zstd-compressed (`.zst`); use
+`zstd -d` to read one by hand. It prints counts, rates, and latency percentiles per span name. Use
 it to measure background work or to compare two builds.
 
 ```bash

@@ -73,6 +73,10 @@ function cleanupFailureReason(error: { readonly message: string }) {
     : (error.message.split(/\r?\n/)[0] ?? error.message);
 }
 
+/** A rotated log backup, plain (`x.log.1`), zstd-compressed (`x.log.2.zst`), or a partial compression (`x.log.2.zst.tmp`). */
+export const isRotatedLogName = (name: string): boolean =>
+  /\.(?:log|ndjson)\.\d+(?:\.zst(?:\.tmp)?)?$/.test(name);
+
 const worktreeCleanupEnabled = (rules: WorktreeCleanupRules) =>
   rules.worktreeAfterDays !== null ||
   rules.worktreeSettledAfterDays !== null ||
@@ -886,7 +890,7 @@ const make = Effect.gen(function* () {
         const stat = yield* fs.stat(target);
         if (stat.type === "Directory" && rotatedLogs) {
           yield* visit(target);
-        } else if (stat.type === "File" && (!rotatedLogs || /\.(?:log|ndjson)\.\d+$/.test(name))) {
+        } else if (stat.type === "File" && (!rotatedLogs || isRotatedLogName(name))) {
           const modified = Option.getOrNull(stat.mtime);
           if (modified !== null && modified.getTime() < now - days * DAY_MS) {
             const current = (yield* settingsService.getSettings).storageCleanup;

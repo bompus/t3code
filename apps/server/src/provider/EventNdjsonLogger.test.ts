@@ -729,6 +729,10 @@ it.layer(NodeServices.layer)("EventNdjsonLogger", (it) => {
       const unrelatedLogPath = NodePath.join(tempDir, "unrelated.log");
       const legacyLogPath = NodePath.join(tempDir, "legacy-thread.log");
       const ignoredPath = NodePath.join(tempDir, "ignored.txt");
+      // Compressed backups are recognized by the owned file name alone.
+      const expiredBackupPath = `${expiredPath}.2.zst`;
+      const newBackupPath = `${newPath}.2.zst`;
+      const unrelatedBackupPath = `${unrelatedLogPath}.1.zst`;
 
       try {
         yield* TestClock.setTime(1_800_000_000_000);
@@ -736,6 +740,12 @@ it.layer(NodeServices.layer)("EventNdjsonLogger", (it) => {
         for (const filePath of [expiredPath, oldPath, newPath, unrelatedLogPath, ignoredPath]) {
           NodeFS.writeFileSync(filePath, "x".repeat(40));
         }
+        for (const filePath of [expiredBackupPath, newBackupPath, unrelatedBackupPath]) {
+          NodeFS.writeFileSync(filePath, "x".repeat(5));
+        }
+        NodeFS.utimesSync(expiredBackupPath, (now - 20_000) / 1_000, (now - 20_000) / 1_000);
+        NodeFS.utimesSync(newBackupPath, now / 1_000, now / 1_000);
+        NodeFS.utimesSync(unrelatedBackupPath, (now - 20_000) / 1_000, (now - 20_000) / 1_000);
         NodeFS.writeFileSync(
           legacyLogPath,
           "[2026-01-01T00:00:00.000Z] CANON: legacy provider event\n",
@@ -755,6 +765,9 @@ it.layer(NodeServices.layer)("EventNdjsonLogger", (it) => {
         assert.equal(NodeFS.existsSync(legacyLogPath), false);
         assert.equal(NodeFS.existsSync(oldPath), false);
         assert.equal(NodeFS.existsSync(newPath), true);
+        assert.equal(NodeFS.existsSync(expiredBackupPath), false);
+        assert.equal(NodeFS.existsSync(newBackupPath), true);
+        assert.equal(NodeFS.existsSync(unrelatedBackupPath), true);
         assert.equal(NodeFS.existsSync(unrelatedLogPath), true);
         assert.equal(NodeFS.existsSync(ignoredPath), true);
       } finally {

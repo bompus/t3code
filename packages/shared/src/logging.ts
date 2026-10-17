@@ -1,8 +1,11 @@
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
+import * as NodeStreamPromises from "node:stream/promises";
+import * as NodeZlib from "node:zlib";
 import * as Schema from "effect/Schema";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Semaphore from "effect/Semaphore";
@@ -185,8 +188,32 @@ export class RotatingFileSink {
   }
 }
 
+/** Backups are cold data, so spend CPU off the write path for a smaller file. */
+const BACKUP_ZSTD_LEVEL = 9;
+
+/** Matches the suffix after `<file>.` for a rotated backup, compressed or not. */
+const BACKUP_SUFFIX_PATTERN = /^(\d+)(?:\.zst)?$/;
+
+/** A backup being compressed. `index` follows the plain file as rotation renames it. */
+interface BackupCompression {
+  index: number;
+  fiber?: Fiber.Fiber<void>;
+}
+
+export interface AsyncRotatingFileSinkOptions extends Omit<
+  RotatingFileSinkOptions,
+  "throwOnError"
+> {
+  /**
+   * Compress each backup with zstd once a newer one exists, leaving `<file>.1`
+   * plain so the latest rotated log is still readable with ordinary tools.
+   * Backups then appear as `<file>.<n>` or `<file>.<n>.zst`.
+   */
+  readonly compressBackups?: boolean;
+}
+
 export const makeAsyncRotatingFileSink = Effect.fnUntraced(function* (
-  options: Omit<RotatingFileSinkOptions, "throwOnError">,
+  options: AsyncRotatingFileSinkOptions,
 ) {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
@@ -212,7 +239,13 @@ export const makeAsyncRotatingFileSink = Effect.fnUntraced(function* (
   yield* Effect.gen(function* () {
     for (const entry of yield* fs.readDirectory(directory)) {
       if (!entry.startsWith(`${basename}.`)) continue;
-      const suffix = Number(entry.slice(basename.length + 1));
+      const rest = entry.slice(basename.length + 1);
+      // A partial compression left by an earlier run.
+      if (/^\d+\.zst\.tmp$/.test(rest)) {
+        yield* fs.remove(path.join(directory, entry), { force: true });
+        continue;
+      }
+      const suffix = Number(BACKUP_SUFFIX_PATTERN.exec(rest)?.[1]);
       if (!Number.isInteger(suffix) || suffix <= options.maxFiles) continue;
       yield* fs.remove(path.join(directory, entry), { force: true });
     }
@@ -225,15 +258,94 @@ export const makeAsyncRotatingFileSink = Effect.fnUntraced(function* (
   );
   let currentSize = yield* readSize;
   const semaphore = yield* Semaphore.make(1);
+  const compressions = new Set<BackupCompression>();
+  let nextCompressionId = 0;
+
+  // Rotation is about to move every backup up one place. Follow the plain
+  // files of running compressions, and cancel the one whose backup is dropped.
+  const shiftCompressions = Effect.gen(function* () {
+    for (const compression of compressions) {
+      if (compression.index >= options.maxFiles) {
+        compressions.delete(compression);
+        if (compression.fiber) yield* Fiber.interrupt(compression.fiber);
+      } else {
+        compression.index += 1;
+      }
+    }
+  });
+
+  // Compresses a backup in the background. The file is read through a handle
+  // opened now, so rotation can rename it freely; the finished copy replaces
+  // the plain file, under the name it has by then, while holding the same
+  // permit as rotation.
+  const startCompression = (index: number) =>
+    Effect.gen(function* () {
+      const handle = yield* Effect.tryPromise(() =>
+        NodeFS.promises.open(`${options.filePath}.${index}`, "r"),
+      );
+      const closeHandle = Effect.promise(() => handle.close().catch(() => undefined));
+      const compression: BackupCompression = { index };
+      const temporary = `${options.filePath}.${nextCompressionId++}.zst.tmp`;
+      const startedWith = yield* Effect.tryPromise(() => handle.stat()).pipe(
+        Effect.tapError(() => closeHandle),
+      );
+      const publish = Effect.tryPromise(async () => {
+        const plain = `${options.filePath}.${compression.index}`;
+        const current = await NodeFS.promises.stat(plain);
+        // The name only identifies the file if rotation kept the bookkeeping in step.
+        if (
+          !compressions.has(compression) ||
+          current.size !== startedWith.size ||
+          current.mtimeMs !== startedWith.mtimeMs
+        ) {
+          throw new Error("backup changed during compression");
+        }
+        await NodeFS.promises.utimes(temporary, startedWith.atime, startedWith.mtime);
+        await NodeFS.promises.rename(temporary, `${plain}.zst`);
+        await NodeFS.promises.rm(plain);
+      });
+      const job = Effect.tryPromise((signal) =>
+        NodeStreamPromises.pipeline(
+          handle.createReadStream({ autoClose: false }),
+          NodeZlib.createZstdCompress({
+            params: { [NodeZlib.constants.ZSTD_c_compressionLevel]: BACKUP_ZSTD_LEVEL },
+          }),
+          NodeFS.createWriteStream(temporary),
+          { signal },
+        ),
+      ).pipe(
+        Effect.andThen(semaphore.withPermits(1)(publish)),
+        Effect.ignore,
+        Effect.ensuring(
+          Effect.promise(() =>
+            NodeFS.promises.rm(temporary, { force: true }).catch(() => undefined),
+          ).pipe(
+            Effect.andThen(closeHandle),
+            Effect.andThen(Effect.sync(() => compressions.delete(compression))),
+          ),
+        ),
+      );
+      compressions.add(compression);
+      compression.fiber = yield* Effect.forkDetach(job);
+    }).pipe(Effect.ignore);
+
   const rotate = Effect.gen(function* () {
-    yield* fs.remove(`${options.filePath}.${options.maxFiles}`, { force: true });
+    const oldest = `${options.filePath}.${options.maxFiles}`;
+    yield* fs.remove(oldest, { force: true });
+    yield* fs.remove(`${oldest}.zst`, { force: true });
+    yield* shiftCompressions;
     for (let index = options.maxFiles - 1; index >= 1; index--) {
-      const source = `${options.filePath}.${index}`;
-      if (yield* fs.exists(source)) yield* fs.rename(source, `${options.filePath}.${index + 1}`);
+      for (const extension of ["", ".zst"]) {
+        const source = `${options.filePath}.${index}${extension}`;
+        if (yield* fs.exists(source)) {
+          yield* fs.rename(source, `${options.filePath}.${index + 1}${extension}`);
+        }
+      }
     }
     if (yield* fs.exists(options.filePath))
       yield* fs.rename(options.filePath, `${options.filePath}.1`);
     currentSize = 0;
+    if (options.compressBackups && options.maxFiles >= 2) yield* startCompression(2);
   }).pipe(Effect.mapError(failure("rotate")));
   const write = (chunk: string | Buffer) =>
     semaphore
@@ -260,5 +372,15 @@ export const makeAsyncRotatingFileSink = Effect.fnUntraced(function* (
         ),
       )
       .pipe(Effect.uninterruptible);
-  return { write };
+  /** Completes once every backup compression started by this sink has finished. */
+  const settleCompression = Effect.suspend(() =>
+    Effect.forEach(
+      Array.from(compressions, (compression) => compression.fiber).filter(
+        (fiber): fiber is Fiber.Fiber<void> => fiber !== undefined,
+      ),
+      Fiber.await,
+      { discard: true },
+    ),
+  );
+  return { write, settleCompression };
 });

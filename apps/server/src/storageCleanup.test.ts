@@ -47,6 +47,7 @@ import {
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import {
+  isRotatedLogName,
   storageCleanupActivityAt,
   storageCleanupPullRequestMerged,
   storageCleanupThreadIdle,
@@ -1825,3 +1826,22 @@ it.live.each(["thread.settled", "stopped", "ready"] as const)(
       }),
     ),
 );
+
+describe("rotated log names", () => {
+  it.each([
+    "server.trace.ndjson.3",
+    "events.abc.log.1",
+    "events.abc.log.2.zst",
+    "x.ndjson.10.zst",
+    "x.log.3.zst.tmp",
+  ])("matches backup %s", (name) => {
+    expect(isRotatedLogName(name)).toBe(true);
+  });
+
+  it.each(["server.trace.ndjson", "events.abc.log", "events.abc.log.2.gz", "notes.log.zst.tmp"])(
+    "ignores %s",
+    (name) => {
+      expect(isRotatedLogName(name)).toBe(false);
+    },
+  );
+});

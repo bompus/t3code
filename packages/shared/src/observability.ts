@@ -358,6 +358,7 @@ export const makeTraceSink = Effect.fn("makeTraceSink")(function* (options: Trac
     filePath: options.filePath,
     maxBytes: options.maxBytes,
     maxFiles: options.maxFiles,
+    compressBackups: true,
   }).pipe(Effect.orDie);
 
   let buffer: Array<{ readonly text: string; readonly bytes: number }> = [];
@@ -461,7 +462,9 @@ export const makeTraceSink = Effect.fn("makeTraceSink")(function* (options: Trac
       Effect.updateContext(Context.omit(Tracer.ParentSpan)<never>),
     );
 
-  yield* Effect.addFinalizer(() => flush.pipe(Effect.ignore));
+  // Backups compress in the background; shutdown waits so nothing is cut off.
+  const settleCompression = sink.settleCompression;
+  yield* Effect.addFinalizer(() => flush.pipe(Effect.andThen(settleCompression), Effect.ignore));
   yield* Effect.forkScoped(
     Queue.take(flushRequests).pipe(
       Effect.timeoutOption(`${options.batchWindowMs} millis`),
@@ -491,7 +494,7 @@ export const makeTraceSink = Effect.fn("makeTraceSink")(function* (options: Trac
       }
     },
     flush,
-    close: () => flush,
+    close: () => flush.pipe(Effect.andThen(settleCompression)),
   } satisfies TraceSink;
 });
 

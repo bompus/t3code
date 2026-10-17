@@ -370,7 +370,7 @@ export function boundProviderEventForLogging(event: unknown): unknown {
 }
 
 export const writeBatchedMessages = Effect.fnUntraced(function* (
-  sink: AsyncFileSink,
+  sink: Pick<AsyncFileSink, "write">,
   records: ReadonlyArray<PendingRecord>,
   maxBytes: number,
   onWritten: (records: ReadonlyArray<PendingRecord>) => void,
@@ -405,8 +405,11 @@ async function isProviderLogFile(
   fileName: string,
   filePrefix: string,
 ): Promise<boolean> {
-  if (!/\.log(?:\.\d+)?$/u.test(fileName)) return false;
+  if (!/\.log(?:\.\d+(?:\.zst(?:\.tmp)?)?)?$/u.test(fileName)) return false;
   if (fileName.startsWith(filePrefix)) return true;
+  // The content check below reads plain text; compressed backups and their
+  // partial copies are only recognized by their prefix.
+  if (/\.zst(?:\.tmp)?$/u.test(fileName)) return false;
 
   const descriptor = await NodeFS.promises.open(filePath, "r");
   try {
@@ -657,6 +660,7 @@ export const makeEventNdjsonLogStore = Effect.fnUntraced(function* (
       filePath,
       maxBytes: resolved.maxBytes,
       maxFiles: resolved.maxFiles,
+      compressBackups: true,
     }).pipe(
       Effect.provideService(FileSystem.FileSystem, fs),
       Effect.provideService(Path.Path, path),
@@ -748,6 +752,9 @@ export const makeEventNdjsonLogStore = Effect.fnUntraced(function* (
   const close = Effect.fnUntraced(function* () {
     yield* flush(false, true);
     yield* Scope.close(timerScope, Exit.void);
+    // Let in-flight backup compression finish so nothing writes after close.
+    const { sinks } = yield* SynchronizedRef.get(stateRef);
+    yield* Effect.forEach(sinks.values(), (sink) => sink.settleCompression, { discard: true });
   });
 
   const loggerViews = new Map<EventNdjsonStream, ProviderEventLoggers.EventNdjsonLogger>();

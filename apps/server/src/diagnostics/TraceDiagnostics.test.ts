@@ -8,6 +8,7 @@ import * as Option from "effect/Option";
 import * as PlatformError from "effect/PlatformError";
 import * as References from "effect/References";
 import * as Stream from "effect/Stream";
+import * as NodeZlib from "node:zlib";
 
 import * as TraceDiagnostics from "./TraceDiagnostics.ts";
 
@@ -221,6 +222,96 @@ describe("TraceDiagnostics", () => {
         diagnostics,
         aggregateLines([...files.values()].flatMap((text) => text.split(/\r?\n/))),
       );
+    }),
+  );
+
+  it.effect("reads a rotated backup that was compressed to .zst", () =>
+    Effect.gen(function* () {
+      const backupText = [
+        record({
+          name: "server.getConfig",
+          traceId: "trace-a",
+          spanId: "span-a",
+          startMs: 1_000,
+          durationMs: 50,
+        }),
+        "not-json",
+        record({
+          name: "orchestration.dispatch",
+          traceId: "trace-b",
+          spanId: "span-b",
+          startMs: 2_000,
+          durationMs: 1_500,
+          exit: { _tag: "Failure", cause: "Provider crashed: café 🔥" },
+        }),
+        "",
+      ].join("\n");
+      const currentText = record({
+        name: "git.status",
+        traceId: "trace-c",
+        spanId: "span-c",
+        startMs: 3_000,
+        durationMs: 25,
+      });
+      const notFound = PlatformError.systemError({
+        _tag: "NotFound",
+        module: "FileSystem",
+        method: "open",
+        description: "no such file",
+        pathOrDescriptor: `${traceFilePath}.1`,
+      });
+
+      const diagnostics = yield* readTraces({
+        stream: (path) =>
+          path === traceFilePath
+            ? Stream.make(new TextEncoder().encode(currentText))
+            : path === `${traceFilePath}.1.zst`
+              ? Stream.make(NodeZlib.zstdCompressSync(backupText))
+              : Stream.fail(notFound),
+      });
+
+      assert.equal(diagnostics.recordCount, 3);
+      assert.deepStrictEqual(
+        diagnostics,
+        aggregateLines([...backupText.split("\n").slice(0, -1), currentText]),
+      );
+    }),
+  );
+
+  it.effect("reports a corrupt .zst backup as a read failure and keeps the rest", () =>
+    Effect.gen(function* () {
+      const notFound = PlatformError.systemError({
+        _tag: "NotFound",
+        module: "FileSystem",
+        method: "open",
+        description: "no such file",
+        pathOrDescriptor: `${traceFilePath}.1`,
+      });
+
+      const diagnostics = yield* readTraces({
+        stream: (path) =>
+          path === traceFilePath
+            ? Stream.make(
+                new TextEncoder().encode(
+                  record({
+                    name: "git.status",
+                    traceId: "trace-c",
+                    spanId: "span-c",
+                    startMs: 3_000,
+                    durationMs: 25,
+                  }),
+                ),
+              )
+            : path === `${traceFilePath}.1.zst`
+              ? Stream.make(new TextEncoder().encode("not zstd"))
+              : Stream.fail(notFound),
+      });
+
+      assert.equal(diagnostics.recordCount, 1);
+      assert.deepStrictEqual(Option.getOrUndefined(diagnostics.error), {
+        kind: "trace-file-read-failed",
+        message: `Failed to read local trace file '${traceFilePath}.1.zst'.`,
+      });
     }),
   );
 
