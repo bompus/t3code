@@ -91,25 +91,56 @@ function summarizeDynamicValue(value: unknown): unknown {
   };
 }
 
+const OUTPUT_FACT_INDICATES_FAILURE = 1;
+const OUTPUT_FACT_HAS_CONTENT = 2;
+
+/**
+ * The only things the wire projection reads from command output: whether it describes a
+ * failure and whether it holds any text. Stored beside a payload, they let a reader
+ * leave the output itself unread.
+ */
+export function commandOutputFacts(output: string | undefined): number {
+  return (
+    (output !== undefined && toolOutputIndicatesFailure(output.slice(0, MAX_DETAIL_STRING_BYTES))
+      ? OUTPUT_FACT_INDICATES_FAILURE
+      : 0) | (output?.trim() ? OUTPUT_FACT_HAS_CONTENT : 0)
+  );
+}
+
+function projectCommandExecutionForWire(
+  item: Extract<OrchestrationV2TurnItem, { type: "command_execution" }>,
+  facts: number,
+): OrchestrationV2TurnItem {
+  const { output: _output, ...projected } = item;
+  const failed =
+    item.outputIndicatesFailure === true ||
+    (item.exitCode !== undefined && item.exitCode !== 0) ||
+    (facts & OUTPUT_FACT_INDICATES_FAILURE) !== 0;
+  return {
+    ...projected,
+    ...(failed ? { outputIndicatesFailure: true } : {}),
+    ...((facts & OUTPUT_FACT_HAS_CONTENT) !== 0 ? { outputOmitted: true } : {}),
+  };
+}
+
+/** Projects an item whose command output was left unread, using the facts stored with it. */
+export function projectTurnItemForWireWithOutputFacts(
+  item: OrchestrationV2TurnItem,
+  facts: number | null,
+): OrchestrationV2TurnItem {
+  return item.type === "command_execution" && facts !== null
+    ? projectCommandExecutionForWire(item, facts)
+    : projectTurnItemForWire(item);
+}
+
 export function projectTurnItemForWire(item: OrchestrationV2TurnItem): OrchestrationV2TurnItem {
   switch (item.type) {
     case "handoff": {
       const { summary: _summary, ...projected } = item;
       return projected;
     }
-    case "command_execution": {
-      const { output, ...projected } = item;
-      const failed =
-        item.outputIndicatesFailure === true ||
-        (item.exitCode !== undefined && item.exitCode !== 0) ||
-        (output !== undefined &&
-          toolOutputIndicatesFailure(output.slice(0, MAX_DETAIL_STRING_BYTES)));
-      return {
-        ...projected,
-        ...(failed ? { outputIndicatesFailure: true } : {}),
-        ...(output?.trim() ? { outputOmitted: true } : {}),
-      };
-    }
+    case "command_execution":
+      return projectCommandExecutionForWire(item, commandOutputFacts(item.output));
     case "file_change": {
       const { diffStr, oldStr: _old, newStr: _new, ...projected } = item;
       return item.status === "failed" && diffStr?.trim()

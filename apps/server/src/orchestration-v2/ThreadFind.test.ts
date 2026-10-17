@@ -1057,6 +1057,97 @@ describe("V2 history materialization", () => {
     }).pipe(Effect.provide(layerTest)),
   );
 
+  it.effect(
+    "reads the same wire items for command output with stored facts, legacy rows and updates",
+    () =>
+      Effect.gen(function* () {
+        const projection = yield* setup;
+        const sql = yield* SqlClient.SqlClient;
+        const command = (
+          id: string,
+          ordinal: number,
+          fields: { output?: string; exitCode?: number },
+        ) => ({
+          ...item(id, ordinal, ""),
+          type: "command_execution" as const,
+          input: "run",
+          ...fields,
+        });
+        const lateFailure = `${"x".repeat(40_000)}\nCommandNotFoundException`;
+        const items = [
+          command("plain", 0, { output: "ok\n", exitCode: 0 }),
+          command("failing", 1, { output: "bash: foo: command not found", exitCode: 0 }),
+          command("late-failure-phrase", 2, { output: lateFailure }),
+          command("blank", 3, { output: "  \n" }),
+          command("empty", 4, { output: "" }),
+          command("no-output", 5, {}),
+          command("nonzero-exit", 6, { output: "x".repeat(100_000), exitCode: 2 }),
+          command("legacy", 7, { output: "ENOENT" }),
+        ];
+        yield* putItems(items);
+        yield* sql`UPDATE orchestration_v2_projection_turn_items SET output_facts = NULL WHERE turn_item_id = 'legacy'`;
+        const factsOf = () =>
+          sql<{ turn_item_id: string; output_facts: number | null }>`
+          SELECT turn_item_id, output_facts FROM orchestration_v2_projection_turn_items
+          WHERE thread_id = ${threadId} AND type = 'command_execution' ORDER BY ordinal`.pipe(
+            Effect.map((rows) =>
+              Object.fromEntries(rows.map((row) => [row.turn_item_id, row.output_facts])),
+            ),
+          );
+        const assertPageMatchesWire = Effect.gen(function* () {
+          const snapshot = yield* projection.getThreadSnapshot(threadId);
+          const rows = snapshot.projection.visibleTurnItems.map((row) => ({
+            ...row,
+            item: projectTurnItemForWire(row.item),
+          }));
+          const cursor = encodeThreadHistoryCursor({
+            snapshotSequence: snapshot.snapshotSequence,
+            sourceThreadId: threadId,
+            sourceItemId: "absent",
+            position: rows.length,
+          });
+          assert.deepEqual(yield* projection.getThreadHistoryPage(threadId, cursor), {
+            snapshotSequence: snapshot.snapshotSequence,
+            ...selectHistoryPageFromCursor({
+              items: rows,
+              cursor,
+              snapshotSequence: snapshot.snapshotSequence,
+            }),
+          });
+          return rows.map((row) => row.item);
+        });
+
+        const wire = yield* assertPageMatchesWire;
+        const flags = (id: string) => {
+          const found = wire.find((entry) => entry.id === id);
+          return found?.type === "command_execution"
+            ? [found.outputIndicatesFailure === true, found.outputOmitted === true]
+            : undefined;
+        };
+        assert.deepEqual(flags("plain"), [false, true]);
+        assert.deepEqual(flags("failing"), [true, true]);
+        assert.deepEqual(flags("late-failure-phrase"), [false, true]);
+        assert.deepEqual(flags("blank"), [false, false]);
+        assert.deepEqual(flags("empty"), [false, false]);
+        assert.deepEqual(flags("no-output"), [false, false]);
+        assert.deepEqual(flags("nonzero-exit"), [true, true]);
+        assert.deepEqual(flags("legacy"), [true, true]);
+        const facts = yield* factsOf();
+        assert.equal(facts.plain, 2);
+        assert.equal(facts.failing, 3);
+        assert.equal(facts["no-output"], 0);
+        assert.equal(facts.legacy, null);
+
+        // A later update to the same item replaces its stored facts.
+        yield* putItems(
+          [command("plain", 0, { output: "bash: foo: command not found", exitCode: 0 })],
+          "again",
+        );
+        assert.equal((yield* factsOf()).plain, 3);
+        yield* assertPageMatchesWire;
+      }).pipe(Effect.provide(layerTest)),
+  );
+
   it.effect("keeps cached timeline reads current as the thread and its fork source change", () =>
     Effect.gen(function* () {
       const projection = yield* setup;

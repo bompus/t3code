@@ -1,5 +1,9 @@
 import { applyThreadPullRequestLinkUpdate } from "@t3tools/shared/threadPullRequests";
-import { projectTurnItemForWire } from "./WireProjection.ts";
+import {
+  commandOutputFacts,
+  projectTurnItemForWire,
+  projectTurnItemForWireWithOutputFacts,
+} from "./WireProjection.ts";
 import * as Stream from "effect/Stream";
 import { makeThreadFind, findProjectedThreadItems } from "./ThreadFind.ts";
 import type {
@@ -2448,7 +2452,8 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 type,
                 status,
                 updated_at,
-                payload_json
+                payload_json,
+                output_facts
               )
               VALUES (
                 ${event.payload.id},
@@ -2462,7 +2467,8 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 ${event.payload.type},
                 ${event.payload.status},
                 ${stringField(payload, "updatedAt")},
-                ${payloadJson}
+                ${payloadJson},
+                ${event.payload.type === "command_execution" ? commandOutputFacts(event.payload.output) : null}
               )
               ON CONFLICT(turn_item_id)
               DO UPDATE SET
@@ -2476,7 +2482,8 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 type = excluded.type,
                 status = excluded.status,
                 updated_at = excluded.updated_at,
-                payload_json = excluded.payload_json
+                payload_json = excluded.payload_json,
+                output_facts = excluded.output_facts
             `;
             break;
           }
@@ -5072,37 +5079,47 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 .filter((row) => !row.synthetic)
                 .map((row) => ({ threadId: row.sourceThreadId, id: row.sourceItemId })),
             );
-            // The wire projection drops the diffs of file changes that did not fail, so the
-            // page does not read them.
+            // The wire projection drops command output and the diffs of file changes that did
+            // not fail, so the page does not read them. Output is left unread only when its
+            // facts were stored with the row.
             const payloads = yield* sql<{
               thread_id: string;
               turn_item_id: string;
               payload_json: string;
+              output_facts: number | null;
             }>`
-          SELECT item.thread_id, item.turn_item_id,
-            CASE WHEN item.type = 'file_change' AND item.status <> 'failed'
+          SELECT item.thread_id, item.turn_item_id, item.output_facts,
+            CASE
+              WHEN item.type = 'command_execution' AND item.output_facts IS NOT NULL
+              THEN json_remove(item.payload_json, '$.output')
+              WHEN item.type = 'file_change' AND item.status <> 'failed'
               THEN json_remove(item.payload_json, '$.diffStr', '$.oldStr', '$.newStr')
-              ELSE item.payload_json END AS payload_json
+              ELSE item.payload_json
+            END AS payload_json
           FROM orchestration_v2_projection_turn_items item JOIN json_each(${sources}) wanted
           ON item.thread_id = json_extract(wanted.value, '$.threadId')
             AND item.turn_item_id = json_extract(wanted.value, '$.id')`;
             const byIdentity = new Map(
-              payloads.map((row) => [`${row.thread_id}:${row.turn_item_id}`, row.payload_json]),
+              payloads.map((row) => [`${row.thread_id}:${row.turn_item_id}`, row]),
             );
             const items = yield* Effect.forEach(materialized, (row) =>
               Effect.gen(function* () {
                 const payload = byIdentity.get(`${row.sourceThreadId}:${row.sourceItemId}`);
                 const item =
-                  row.synthetic ??
-                  (payload === undefined
-                    ? yield* new ProjectionStoreReadError({ threadId })
-                    : yield* decodeTurnItemPayload(payload));
+                  row.synthetic !== undefined
+                    ? projectTurnItemForWire(row.synthetic)
+                    : payload === undefined
+                      ? yield* new ProjectionStoreReadError({ threadId })
+                      : projectTurnItemForWireWithOutputFacts(
+                          yield* decodeTurnItemPayload(payload.payload_json),
+                          payload.output_facts,
+                        );
                 return {
                   position: row.canonicalPosition,
                   visibility: row.visibility,
                   sourceThreadId: row.sourceThreadId,
                   sourceItemId: row.sourceItemId,
-                  item: projectTurnItemForWire(item),
+                  item,
                 };
               }),
             );

@@ -1428,7 +1428,10 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
         const sql = yield* SqlClient.SqlClient;
         const duplicateItemId = TurnItemId.make("item:bounded-node-history:duplicate");
         yield* sql`
-          INSERT INTO orchestration_v2_projection_turn_items
+          INSERT INTO orchestration_v2_projection_turn_items (
+            turn_item_id, thread_id, run_id, node_id, provider_thread_id, provider_turn_id,
+            parent_item_id, ordinal, type, status, updated_at, payload_json
+          )
           SELECT ${duplicateItemId}, thread_id, run_id, node_id, provider_thread_id,
             provider_turn_id, parent_item_id, ordinal + 1, type, status, updated_at,
             json_set(payload_json, '$.id', ${duplicateItemId}, '$.ordinal', ordinal + 1)

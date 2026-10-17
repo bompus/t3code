@@ -438,7 +438,10 @@ it.effect(
       yield* createItem(threadId, runId, "completed");
       yield* sql`UPDATE orchestration_v2_projection_turn_items SET payload_json = '{broken' WHERE thread_id = ${threadId}`;
       yield* sql`UPDATE orchestration_v2_projection_runs SET payload_json = '{broken' WHERE thread_id = ${source}`;
-      yield* sql`INSERT INTO orchestration_v2_projection_turn_items
+      yield* sql`INSERT INTO orchestration_v2_projection_turn_items (
+        turn_item_id, thread_id, run_id, node_id, provider_thread_id, provider_turn_id,
+        parent_item_id, ordinal, type, status, updated_at, payload_json
+      )
       SELECT 'history:' || value, i.thread_id, i.run_id, i.node_id, i.provider_thread_id, i.provider_turn_id,
         i.parent_item_id, i.ordinal + value, i.type, i.status, i.updated_at, i.payload_json
       FROM orchestration_v2_projection_turn_items i, json_each(${encodeNumbers(Array.from({ length: 2000 }, (_, i) => i + 1))})
