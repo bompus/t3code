@@ -1324,6 +1324,89 @@ describe("MessagesTimeline scroll position", () => {
     return props.listRef.current!.getScrollableNode()!;
   }
 
+  it("does not interrupt a smooth jump when following is re-enabled without new rows", async () => {
+    const props = baseProps();
+    const timeline = (following: boolean) => (
+      <MessagesTimeline {...props} timelineEntries={tallEntries} liveFollowEnabled={following} />
+    );
+    await renderElement(timeline(false));
+    const viewport = await waitForList(props);
+    await act(async () => {
+      viewport.scrollTop = 0;
+      viewport.dispatchEvent(new Event("scroll"));
+    });
+    const scrollable: { scrollTo(options: ScrollToOptions): void } = viewport;
+    const scrollTo = vi.spyOn(scrollable, "scrollTo");
+
+    await act(async () => roots.at(-1)!.render(timeline(true)));
+    await act(async () => {
+      void props.listRef.current!.scrollToEnd({ animated: true });
+      for (let frame = 0; frame < 5; frame += 1) {
+        await new Promise(requestAnimationFrame);
+      }
+    });
+
+    expect(scrollTo.mock.calls.some(([options]) => options?.behavior === "smooth")).toBe(true);
+    expect(scrollTo.mock.calls.some(([options]) => options?.behavior === "auto")).toBe(false);
+  });
+
+  it("keeps following when completed rows grow the list by more than a viewport", async () => {
+    const props = baseProps();
+    await renderElement(<MessagesTimeline {...props} timelineEntries={tallEntries} />);
+    const viewport = await waitForList(props);
+    await vi.waitFor(() =>
+      expect(
+        viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop,
+      ).toBeLessThanOrEqual(1),
+    );
+    const initialHeight = viewport.scrollHeight;
+    await act(async () =>
+      roots
+        .at(-1)!
+        .render(
+          <MessagesTimeline
+            {...props}
+            timelineEntries={[
+              ...tallEntries,
+              ...Array.from({ length: 12 }, (_, index) => tall(index + 12)),
+            ]}
+          />,
+        ),
+    );
+
+    await vi.waitFor(() => {
+      expect(viewport.scrollHeight - initialHeight).toBeGreaterThan(viewport.clientHeight);
+      expect(
+        viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop,
+      ).toBeLessThanOrEqual(1);
+    });
+  });
+
+  it("keeps a followed message visible when its measured height grows by several viewports", async () => {
+    const props = baseProps();
+    await renderElement(<MessagesTimeline {...props} timelineEntries={tallEntries} />);
+    const viewport = await waitForList(props);
+    await vi.waitFor(() =>
+      expect(
+        viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop,
+      ).toBeLessThanOrEqual(1),
+    );
+    const row = viewport.querySelector<HTMLElement>('[data-message-id="message-11"]')!;
+    expect(row).not.toBeNull();
+    const initialHeight = viewport.scrollHeight;
+
+    await act(async () => {
+      row.style.paddingBottom = `${viewport.clientHeight * 4}px`;
+    });
+
+    await vi.waitFor(() => {
+      expect(viewport.scrollHeight - initialHeight).toBeGreaterThan(viewport.clientHeight * 2);
+      expect(
+        viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop,
+      ).toBeLessThanOrEqual(1);
+    });
+  });
+
   it("settles when earlier short replies load above long ones", async () => {
     const props = baseProps();
     const short = Array.from({ length: 80 }, (_, index) =>

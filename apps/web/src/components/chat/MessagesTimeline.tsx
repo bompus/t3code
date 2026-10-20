@@ -1518,7 +1518,9 @@ const ConversationTimeline = memo(function ConversationTimeline({
                   ? false
                   : maintainVisibleContentPosition
               }
-              maintainScrollAtEndThreshold={1}
+              // Live-follow intent is owned by ChatView, including user navigation.
+              // Row measurement can grow content by more than a viewport at once.
+              maintainScrollAtEndThreshold={Number.POSITIVE_INFINITY}
               onScroll={handleScroll}
               onItemSizeChanged={handleItemSizeChanged}
               className={cn(
