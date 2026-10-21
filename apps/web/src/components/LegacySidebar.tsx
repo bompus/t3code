@@ -68,7 +68,7 @@ import {
   squashAtomCommandFailure,
 } from "@t3tools/client-runtime/state/runtime";
 import { threadRuntimeCanArchive } from "@t3tools/client-runtime/state/models";
-import { useNavigate, useParams, useRouter } from "@tanstack/react-router";
+import { useNavigate, useRouter } from "@tanstack/react-router";
 import {
   MAX_SIDEBAR_THREAD_PREVIEW_COUNT,
   MIN_SIDEBAR_THREAD_PREVIEW_COUNT,
@@ -129,13 +129,9 @@ import { useThreadActions } from "../hooks/useThreadActions";
 import { projectEnvironment } from "../state/projects";
 import { threadEnvironment, useEnvironmentThread } from "../state/threads";
 import { useEnvironment, useEnvironments, usePrimaryEnvironmentId } from "../state/environments";
-import {
-  buildThreadRouteParams,
-  resolveActiveThreadRouteRef,
-  resolveThreadRouteTarget,
-} from "../threadRoutes";
+import { buildThreadRouteParams, resolveActiveThreadRouteRef } from "../threadRoutes";
 import { stackedThreadToast, toastManager } from "./ui/toast";
-import { formatRelativeTimeLabel } from "../timestampFormat";
+import { RelativeTime } from "./RelativeTime";
 import { Kbd } from "./ui/kbd";
 import {
   getArm64IntelBuildWarningDescription,
@@ -189,6 +185,7 @@ import {
   archiveSelectedThreadEntries,
   buildMultiSelectThreadContextMenuItems,
   deleteSelectedThreadEntries,
+  filterSidebarV2VisibleThreads,
   getSidebarThreadIdsToPrewarm,
   resolveAdjacentThreadId,
   isContextMenuPointerDown,
@@ -209,7 +206,7 @@ import { SidebarChromeFooter, SidebarChromeHeader } from "./sidebar/SidebarChrom
 import { useCopyToClipboard } from "~/hooks/useCopyToClipboard";
 import { useIsMobile } from "~/hooks/useMediaQuery";
 import { CommandDialogTrigger } from "./ui/command";
-import { useClientSettings, useUpdateClientSettings } from "~/hooks/useSettings";
+import { useClientSettings, updateClientSettings } from "~/hooks/useSettings";
 import { primaryServerKeybindingsAtom } from "../state/server";
 import {
   derivePhysicalProjectKey,
@@ -225,6 +222,7 @@ import {
   type SidebarProjectSnapshot,
 } from "../sidebarProjectGrouping";
 import { PullRequestGlyph } from "~/components/pullRequest/pullRequestIcons";
+import { useThreadRouteTarget } from "../hooks/useThreadRouteTarget";
 const SIDEBAR_SORT_LABELS: Record<SidebarProjectSortOrder, string> = {
   updated_at: "Last user message",
   created_at: "Created at",
@@ -289,13 +287,6 @@ function projectGroupingModeDescription(mode: SidebarProjectGroupingMode): strin
     case "separate":
       return "Every project path gets its own sidebar row.";
   }
-}
-
-// Every project row keys on this map, so it gets its own cache: inline, it
-// shared one with the modifier-key state and rebuilt on every key press.
-function useThreadJumpLabelMap(input: Parameters<typeof buildThreadJumpLabelMap>[0]) {
-  "use memo";
-  return buildThreadJumpLabelMap(input);
 }
 
 function buildThreadJumpLabelMap(input: {
@@ -383,13 +374,6 @@ function checkTaskPermission(environmentId: EnvironmentId): boolean {
   return false;
 }
 
-// The row's handlers key on this ref; built inline, the hooks after it kept the
-// compiler from caching it, so every render rebuilt all of them.
-function useScopedThreadRef(environmentId: EnvironmentId, threadId: ThreadId) {
-  "use memo";
-  return scopeThreadRef(environmentId, threadId);
-}
-
 const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowProps) {
   const {
     orderedProjectThreadKeys,
@@ -420,16 +404,8 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
   } = props;
   const canOperateThread = useEnvironmentScope(thread.environmentId, AuthOrchestrationOperateScope);
   const canOperatePreview = useEnvironmentScope(thread.environmentId, AuthPreviewOperateScope);
-  const threadRef = useScopedThreadRef(thread.environmentId, thread.id);
-  const threadKey = scopedThreadKey(threadRef);
+  const threadKey = scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id));
   const [isFileDragOver, setIsFileDragOver] = useState(false);
-  const fileDropHandlers = makeWorkspaceFileDropHandlers({
-    setDragActive: setIsFileDragOver,
-    addFiles: (files) => {
-      onFileDropThreads(threadRef, files);
-    },
-    addFolders: () => {},
-  });
   useEffect(() => {
     if (!isFileDragOver) return;
     const clearFileDrag = () => setIsFileDragOver(false);
@@ -462,6 +438,32 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
   const threadEnvironmentLabel = isRemoteThread
     ? (remoteEnvLabel ?? (isDesktopLocalThread ? "Local" : "Remote"))
     : null;
+  const isThreadRunning = !threadRuntimeCanArchive(thread.runtime);
+  const threadStatus = resolveThreadStatusPill({
+    thread: {
+      ...thread,
+      lastVisitedAt,
+    },
+  });
+  const linkedPullRequestStatus = useLinkedThreadPullRequest(
+    thread.environmentId,
+    thread.linkedPullRequest,
+    leaseLiveStatus,
+    thread.pullRequests,
+    thread.branchPullRequest,
+  );
+  const pr = linkedPullRequestStatus?.pr ?? null;
+  const supportsMultiplePullRequests = useSupportsMultiplePullRequests(thread.environmentId);
+  // Every hook runs above this line: the handlers below key on this ref, and the
+  // compiler can only cache it once no hook call follows its plain uses.
+  const threadRef = scopeThreadRef(thread.environmentId, thread.id);
+  const fileDropHandlers = makeWorkspaceFileDropHandlers({
+    setDragActive: setIsFileDragOver,
+    addFiles: (files) => {
+      onFileDropThreads(threadRef, files);
+    },
+    addFolders: () => {},
+  });
   const isHighlighted = isActive || isSelected;
   const handleOpenDiscoveredPort = (event: React.MouseEvent<HTMLButtonElement>) => {
     const port = discoveredPorts[0];
@@ -484,22 +486,6 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
       );
     })();
   };
-  const isThreadRunning = !threadRuntimeCanArchive(thread.runtime);
-  const threadStatus = resolveThreadStatusPill({
-    thread: {
-      ...thread,
-      lastVisitedAt,
-    },
-  });
-  const linkedPullRequestStatus = useLinkedThreadPullRequest(
-    thread.environmentId,
-    thread.linkedPullRequest,
-    leaseLiveStatus,
-    thread.pullRequests,
-    thread.branchPullRequest,
-  );
-  const pr = linkedPullRequestStatus?.pr ?? null;
-  const supportsMultiplePullRequests = useSupportsMultiplePullRequests(thread.environmentId);
   const currentLinkedPr = supportsMultiplePullRequests
     ? resolveThreadCurrentPullRequestLink(thread.pullRequests)
     : null;
@@ -889,9 +875,9 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
                       isHighlighted ? "text-foreground" : "text-secondary-label"
                     }`}
                   >
-                    {formatRelativeTimeLabel(
-                      thread.latestUserMessageAt ?? thread.updatedAt ?? thread.createdAt,
-                    )}
+                    <RelativeTime
+                      timestamp={thread.latestUserMessageAt ?? thread.updatedAt ?? thread.createdAt}
+                    />
                   </span>
                 )}
               </span>
@@ -1002,7 +988,7 @@ const SidebarProjectThreadList = memo(function SidebarProjectThreadList(
   return (
     <SidebarMenuSub
       ref={attachThreadListAutoAnimateRef}
-      className="mx-0.5 my-0 w-full translate-x-0 overflow-hidden sm:mx-1"
+      className="mx-0.5 my-0 w-full translate-x-0 overflow-hidden empty:hidden sm:mx-1"
     >
       {shouldShowThreadPanel && showEmptyThreadState ? (
         <SidebarMenuSubItem className="w-full" data-thread-selection-safe>
@@ -1124,7 +1110,6 @@ function resolveProjectThreadStatus(
 // SidebarProjectItem frozen: inline, its later calls made the compiler fuse the
 // ordered keys with the route-dependent panel, handing every row a new array.
 function useProjectThreads(project: SidebarProjectSnapshot) {
-  "use memo";
   const threadSortOrder = useClientSettings<SidebarThreadSortOrder>(
     (settings) => settings.sidebarThreadSortOrder,
   );
@@ -1173,7 +1158,7 @@ function useProjectThreads(project: SidebarProjectSnapshot) {
     ]),
   );
   const visibleProjectThreads = sortThreads(
-    sidebarThreads.filter((thread) => thread.archivedAt === null),
+    filterSidebarV2VisibleThreads(sidebarThreads, null),
     threadSortOrder,
   );
   const projectStatus = resolveProjectStatusIndicator(
@@ -1203,7 +1188,6 @@ function useProjectThreadPanel(input: {
   projectExpanded: boolean;
   isThreadListExpanded: boolean;
 }) {
-  "use memo";
   const {
     visibleProjectThreads,
     lastVisitedAtByThreadKey,
@@ -1294,7 +1278,6 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
   const updateThreadMetadata = useOrchestrationCommand(threadEnvironment.updateMetadata, {
     reportFailure: false,
   });
-  const updateSettings = useUpdateClientSettings();
   const router = useRouter();
   const queuePendingFileDrop = useSidebarPendingFileDropStore((s) => s.queuePendingFileDrop);
   const clearPendingFileDrop = useSidebarPendingFileDropStore((s) => s.clearPendingFileDrop);
@@ -2141,7 +2124,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
     } else {
       nextOverrides[overrideKey] = projectGroupingSelection;
     }
-    updateSettings({
+    updateClientSettings({
       sidebarProjectGroupingOverrides: nextOverrides,
     });
     closeProjectGroupingDialog();
@@ -2299,7 +2282,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
                 <span className="absolute inset-0 flex items-center justify-center transition-opacity duration-150 group-hover/project-header:opacity-0">
                   <span
                     className={`size-[9px] rounded-full ${projectStatus.dotClass} ${
-                      projectStatus.pulse ? "animate-status-pulse" : ""
+                      projectStatus.pulse ? "motion-safe:animate-status-pulse" : ""
                     }`}
                   />
                 </span>
@@ -2786,7 +2769,6 @@ interface SidebarProjectsContentProps {
   projectSortOrder: SidebarProjectSortOrder;
   threadSortOrder: SidebarThreadSortOrder;
   threadPreviewCount: SidebarThreadPreviewCount;
-  updateSettings: ReturnType<typeof useUpdateClientSettings>;
   openAddProject: () => void;
   isManualProjectSorting: boolean;
   projectDnDSensors: ReturnType<typeof useSensors>;
@@ -2830,7 +2812,6 @@ const SidebarProjectsContent = memo(function SidebarProjectsContent(
     projectSortOrder,
     threadSortOrder,
     threadPreviewCount,
-    updateSettings,
     openAddProject,
     isManualProjectSorting,
     projectDnDSensors,
@@ -2862,13 +2843,13 @@ const SidebarProjectsContent = memo(function SidebarProjectsContent(
   } = props;
 
   const handleProjectSortOrderChange = (sortOrder: SidebarProjectSortOrder) => {
-    updateSettings({ sidebarProjectSortOrder: sortOrder });
+    updateClientSettings({ sidebarProjectSortOrder: sortOrder });
   };
   const handleThreadSortOrderChange = (sortOrder: SidebarThreadSortOrder) => {
-    updateSettings({ sidebarThreadSortOrder: sortOrder });
+    updateClientSettings({ sidebarThreadSortOrder: sortOrder });
   };
   const handleThreadPreviewCountChange = (count: SidebarThreadPreviewCount) => {
-    updateSettings({ sidebarThreadPreviewCount: count });
+    updateClientSettings({ sidebarThreadPreviewCount: count });
   };
 
   return (
@@ -3046,7 +3027,6 @@ function openAddProjectCommandPalette() {
 // LegacySidebar frozen and cached on their real inputs; inline, its later hook
 // calls made the compiler recompute them, and the props of every row with them.
 function useLegacySidebarProjects() {
-  "use memo";
   const projects = useProjects();
   const projectOrder = useUiStateStore((store) => store.projectOrder);
   const projectGroupingSettings = useClientSettings(selectProjectGroupingSettings);
@@ -3110,7 +3090,6 @@ function useSortedLegacySidebarProjects(input: {
   projectPhysicalKeyByScopedRef: ReadonlyMap<string, string>;
   sidebarProjectSortOrder: SidebarProjectSortOrder;
 }) {
-  "use memo";
   const {
     sidebarProjects,
     physicalToLogicalKey,
@@ -3125,18 +3104,16 @@ function useSortedLegacySidebarProjects(input: {
     ...project,
     id: project.projectKey,
   }));
-  const sortableThreads = sidebarThreads
-    .filter((thread) => thread.archivedAt === null)
-    .map((thread) => {
-      const physicalKey =
-        projectPhysicalKeyByScopedRef.get(
-          scopedProjectKey(scopeProjectRef(thread.environmentId, thread.projectId)),
-        ) ?? scopedProjectKey(scopeProjectRef(thread.environmentId, thread.projectId));
-      return {
-        ...thread,
-        projectId: (physicalToLogicalKey.get(physicalKey) ?? physicalKey) as ProjectId,
-      };
-    });
+  const sortableThreads = filterSidebarV2VisibleThreads(sidebarThreads, null).map((thread) => {
+    const physicalKey =
+      projectPhysicalKeyByScopedRef.get(
+        scopedProjectKey(scopeProjectRef(thread.environmentId, thread.projectId)),
+      ) ?? scopedProjectKey(scopeProjectRef(thread.environmentId, thread.projectId));
+    return {
+      ...thread,
+      projectId: (physicalToLogicalKey.get(physicalKey) ?? physicalKey) as ProjectId,
+    };
+  });
   const sortedProjects = sortProjectsForSidebar(
     sortableProjects,
     sortableThreads,
@@ -3160,7 +3137,6 @@ function useLegacySidebarThreads(input: {
   sidebarThreadPreviewCount: number;
   expandedThreadListsByProject: ReadonlySet<string>;
 }) {
-  "use memo";
   const {
     sortedProjects,
     physicalToLogicalKey,
@@ -3201,9 +3177,7 @@ function useLegacySidebarThreads(input: {
   }
   const visibleSidebarThreadKeys = sortedProjects.flatMap((project) => {
     const projectThreads = sortThreads(
-      (threadsByProjectKey.get(project.projectKey) ?? []).filter(
-        (thread) => thread.archivedAt === null,
-      ),
+      filterSidebarV2VisibleThreads(threadsByProjectKey.get(project.projectKey) ?? [], null),
       sidebarThreadSortOrder,
     );
     const projectExpanded = resolveProjectExpanded(
@@ -3266,14 +3240,10 @@ export default function LegacySidebar() {
   const sidebarThreadSortOrder = useClientSettings((s) => s.sidebarThreadSortOrder);
   const sidebarProjectSortOrder = useClientSettings((s) => s.sidebarProjectSortOrder);
   const sidebarThreadPreviewCount = useClientSettings((s) => s.sidebarThreadPreviewCount);
-  const updateSettings = useUpdateClientSettings();
   const handleNewThread = useNewThreadHandler();
   const { archiveThread, deleteThread, markThreadUnread } = useThreadActions();
   const { isMobile, setOpenMobile } = useSidebar();
-  const routeTarget = useParams({
-    strict: false,
-    select: (params) => resolveThreadRouteTarget(params),
-  });
+  const routeTarget = useThreadRouteTarget();
   const routeDraftThread = useComposerDraftStore((store) =>
     routeTarget?.kind === "draft" ? store.getDraftSession(routeTarget.draftId) : null,
   );
@@ -3406,17 +3376,19 @@ export default function LegacySidebar() {
   };
 
   const isManualProjectSorting = sidebarProjectSortOrder === "manual";
-  const sidebarShortcutContext = {
-    terminalFocus: terminalFocused,
-    terminalOpen: routeTerminalOpen,
-    modelPickerOpen: isModelPickerOpen(),
-  };
-  const threadJumpLabelByKey = useThreadJumpLabelMap({
+  // Built before the modifier-dependent shortcut context so the compiler gives it
+  // its own cache; every project row keys on this map.
+  const threadJumpLabelByKey = buildThreadJumpLabelMap({
     keybindings,
     platform,
     terminalOpen: routeTerminalOpen,
     threadJumpCommandByKey,
   });
+  const sidebarShortcutContext = {
+    terminalFocus: terminalFocused,
+    terminalOpen: routeTerminalOpen,
+    modelPickerOpen: isModelPickerOpen(),
+  };
   const shouldShowThreadJumpHintsNow = shouldShowThreadJumpHintsForModifiers(
     shortcutModifiers,
     keybindings,
@@ -3650,7 +3622,6 @@ export default function LegacySidebar() {
         projectSortOrder={sidebarProjectSortOrder}
         threadSortOrder={sidebarThreadSortOrder}
         threadPreviewCount={sidebarThreadPreviewCount}
-        updateSettings={updateSettings}
         openAddProject={openAddProjectCommandPalette}
         isManualProjectSorting={isManualProjectSorting}
         projectDnDSensors={projectDnDSensors}

@@ -51,7 +51,7 @@ export interface SavedCloudEnvironmentConnection {
   readonly environmentId: EnvironmentId;
   readonly connection: EnvironmentConnectionPresentation;
   readonly relayManaged: boolean;
-  readonly serverConfig?: ServerConfig | null;
+  readonly serverConfig?: Pick<ServerConfig, "environment"> | null;
 }
 
 function RemoteEnvironmentRowsSkeleton() {
@@ -387,7 +387,14 @@ export function CloudEnvironmentConnectRows({
             kind={machineKind}
             className="size-4 shrink-0 text-muted-foreground"
           />
-          <span className="min-w-0 flex-1 truncate text-sm font-medium">{environment.label}</span>
+          <span className="min-w-0 flex-1">
+            <span className="block truncate text-sm font-medium">{environment.label}</span>
+            {unsupportedDetail !== null ? (
+              <span className="mt-0.5 block text-xs text-muted-foreground">
+                {unsupportedDetail}
+              </span>
+            ) : null}
+          </span>
           <Tooltip>
             <TooltipTrigger
               render={<span tabIndex={0} />}

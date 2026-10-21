@@ -1,6 +1,8 @@
+import type { ServerConfig, ServerConfigStreamEvent } from "@t3tools/contracts";
+import * as Option from "effect/Option";
 import { describe, expect, it } from "vite-plus/test";
 
-import { reuseUnchanged } from "./serverConfigProjection.ts";
+import { applyServerConfigProjection, reuseUnchanged } from "./serverConfigProjection.ts";
 
 describe("reuseUnchanged", () => {
   const provider = (checkedAt: string, skills: ReadonlyArray<string>) => ({
@@ -10,25 +12,6 @@ describe("reuseUnchanged", () => {
     skills: skills.map((name) => ({ name })),
   });
 
-  it("returns the previous value when nothing changed", () => {
-    const previous = [provider("a", ["x"])];
-    expect(reuseUnchanged(previous, [provider("a", ["x"])])).toBe(previous);
-  });
-
-  it("keeps unchanged parts when one field changes", () => {
-    const previous = [provider("a", ["x"]), { ...provider("a", ["y"]), instanceId: "codex" }];
-    const next = reuseUnchanged(previous, [
-      provider("b", ["x"]),
-      { ...provider("a", ["y"]), instanceId: "codex" },
-    ]);
-    expect(next).not.toBe(previous);
-    expect(next[0]).not.toBe(previous[0]);
-    expect(next[0]!.checkedAt).toBe("b");
-    expect(next[0]!.models).toBe(previous[0]!.models);
-    expect(next[0]!.skills).toBe(previous[0]!.skills);
-    expect(next[1]).toBe(previous[1]);
-  });
-
   it("takes the new value when keys or lengths change", () => {
     const previous = [provider("a", ["x"])];
     const next = reuseUnchanged(previous, [provider("a", ["x", "z"])]);
@@ -36,5 +19,38 @@ describe("reuseUnchanged", () => {
     expect(next[0]!.models).toBe(previous[0]!.models);
     const dropped = reuseUnchanged({ a: 1, b: 2 }, { a: 1 });
     expect(dropped).toEqual({ a: 1 });
+  });
+});
+
+describe("applyServerConfigProjection settingsUpdated", () => {
+  it("keeps unchanged settings sections when one field changes", () => {
+    const settings = {
+      favorites: [{ provider: "claude", model: "opus" }],
+      providerInstances: {
+        claude: { driver: "claudeAgent", config: { launchArgs: "" } },
+        codex: { driver: "codex" },
+      },
+    };
+    const current = Option.some({
+      config: { settings } as unknown as ServerConfig,
+      latestEvent: {} as ServerConfigStreamEvent,
+      source: "live" as const,
+    });
+    const next = applyServerConfigProjection(current, {
+      type: "settingsUpdated",
+      payload: {
+        settings: {
+          favorites: [{ provider: "claude", model: "opus" }],
+          providerInstances: {
+            claude: { driver: "claudeAgent", config: { launchArgs: "--verbose" } },
+            codex: { driver: "codex" },
+          },
+        },
+      },
+    } as unknown as ServerConfigStreamEvent);
+    const nextSettings = Option.getOrThrow(next).config.settings as unknown as typeof settings;
+    expect(nextSettings.favorites).toBe(settings.favorites);
+    expect(nextSettings.providerInstances.codex).toBe(settings.providerInstances.codex);
+    expect(nextSettings.providerInstances.claude.config.launchArgs).toBe("--verbose");
   });
 });
