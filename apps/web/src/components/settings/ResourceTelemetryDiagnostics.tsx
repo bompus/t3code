@@ -44,7 +44,7 @@ import { ensureLocalApi } from "../../localApi";
 import { serverEnvironment } from "../../state/server";
 import { readEnvironmentScope, useEnvironmentScope } from "../../state/session";
 import { useAtomCommand } from "../../state/use-atom-command";
-import { formatRelativeTime } from "../../timestampFormat";
+import { useRelativeTimeState } from "../../hooks/useRelativeTimeState";
 import { Button } from "../ui/button";
 import { MorphIcon } from "~/components/MorphIcon";
 import { ScrollArea } from "../ui/scroll-area";
@@ -57,7 +57,7 @@ import {
   shouldShowResourceMonitorRetry,
   visibleResourceTelemetryProcesses,
 } from "./ResourceTelemetryDiagnostics.logic";
-import { SettingsSection, useRelativeTimeTick } from "./settingsLayout";
+import { SettingsSection } from "./settingsLayout";
 
 const HISTORY_WINDOWS = [
   { label: "5m", windowMs: 5 * 60_000, bucketMs: 15_000 },
@@ -207,12 +207,8 @@ function SourceStatusBadge({
 }
 
 function LastSampleLabel({ sampledAt }: { sampledAt: DateTime.Utc | null }) {
-  useRelativeTimeTick();
-  if (!sampledAt) {
-    return <span className="text-2xs text-muted-foreground/55">Waiting for sample</span>;
-  }
-  const relative = formatRelativeTime(DateTime.formatIso(sampledAt));
-  if (!relative) {
+  const relative = useRelativeTimeState(sampledAt ? DateTime.formatIso(sampledAt) : null);
+  if (relative.status !== "relative") {
     return <span className="text-2xs text-muted-foreground/55">Waiting for sample</span>;
   }
   return (
@@ -1059,7 +1055,7 @@ export function ResourceTelemetryDiagnostics({
           </div>
           {telemetry.error ? (
             <div className="flex items-start gap-2 border-t border-destructive/20 bg-destructive/5 px-4 py-3 text-xs text-destructive sm:px-5">
-              <AlertTriangleIcon className="mt-0.5 size-3.5 shrink-0" />
+              <AlertTriangleIcon className="size-3.5 h-lh shrink-0" />
               <span>{telemetry.error}</span>
             </div>
           ) : null}
@@ -1237,7 +1233,7 @@ export function ResourceTelemetryDiagnostics({
         <div className="overflow-hidden rounded-2xl border border-border/70 bg-card shadow-xs/5">
           {history.error ? (
             <div className="flex items-start gap-2 border-b border-destructive/20 bg-destructive/5 px-4 py-3 text-xs text-destructive sm:px-5">
-              <AlertTriangleIcon className="mt-0.5 size-3.5 shrink-0" />
+              <AlertTriangleIcon className="size-3.5 h-lh shrink-0" />
               <span>{history.error}</span>
             </div>
           ) : null}

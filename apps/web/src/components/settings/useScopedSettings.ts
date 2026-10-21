@@ -9,16 +9,14 @@ import * as Cause from "effect/Cause";
 import { AsyncResult } from "effect/reactivity";
 import {
   DEFAULT_SERVER_SETTINGS,
-  type ClientSettings,
   type ProjectScopedServerSettingKey,
   type ServerSettings,
   type UnifiedSettings,
 } from "@t3tools/contracts";
 
 import {
-  mergeEnvironmentSettings,
   persistClientSettingsPatch,
-  useClientSettings,
+  useMergedSettings,
   useMigrateModelPreferences,
 } from "../../hooks/useSettings";
 import { serverEnvironment } from "../../state/server";
@@ -36,21 +34,12 @@ import {
   type ScopedSettingsPatch,
 } from "./scopedSettings";
 
-// Callers often pass an inline selector; a separate hook keeps the merge cached across those.
-function useMergedSettings(serverSettings: ServerSettings, clientSettings: ClientSettings) {
-  "use memo";
-  return mergeEnvironmentSettings(serverSettings, clientSettings);
-}
-
 export function useScopedSettings<T = UnifiedSettings>(
   selector?: (settings: UnifiedSettings) => T,
 ): T {
   const { target } = useSettingsScope();
-  const clientSettings = useClientSettings();
-  const serverSettings = target?.settings ?? DEFAULT_SERVER_SETTINGS;
   useMigrateModelPreferences(target?.environmentId ?? null, target?.settings ?? null);
-  const settings = useMergedSettings(serverSettings, clientSettings);
-  return selector ? selector(settings) : (settings as T);
+  return useMergedSettings(target?.settings ?? DEFAULT_SERVER_SETTINGS, selector);
 }
 
 export function useScopedSettingsMixed(keys: readonly (keyof ServerSettings)[]): boolean {

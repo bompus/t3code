@@ -48,6 +48,8 @@ const fullscreenSupported =
   typeof HTMLElement !== "undefined" && "popover" in HTMLElement.prototype;
 
 const MAX_DOWNLOAD_BYTES = 25 * 1024 * 1024;
+// Exclude activation left by input elsewhere in T3.
+const PAGE_ACTIVATION_MS = 5_000;
 
 function saveBlob(blob: Blob, name: string) {
   const url = URL.createObjectURL(blob);
@@ -58,18 +60,6 @@ function saveBlob(blob: Blob, name: string) {
   // Long after the browser has read it: some start the download a task or
   // more after the click, and a revoked URL saves nothing.
   setTimeout(() => URL.revokeObjectURL(url), 60_000);
-}
-
-// The host gets the tool call pushed by an effect keyed on it, so it stays
-// stable across the command hooks that follow.
-function useToolCall(
-  storedItem: NonNullable<ReturnType<typeof useTurnItemDetail>["data"]>["item"] | undefined,
-) {
-  "use memo";
-  if (storedItem?.type !== "dynamic_tool") return undefined;
-  const output = storedItem.output as { readonly result?: unknown } | undefined;
-  const result = output?.result as McpAppCallToolResult | undefined;
-  return { arguments: storedItem.input, result };
 }
 
 export function McpAppFrame(props: {
@@ -142,7 +132,16 @@ export function McpAppFrame(props: {
     revision: props.revision,
   });
   const storedItem = detail.data?.item;
-  const toolCall = useToolCall(storedItem);
+  // The host gets the tool call pushed by an effect keyed on it, so it must stay cached.
+  const toolCall =
+    storedItem?.type === "dynamic_tool"
+      ? {
+          arguments: storedItem.input,
+          result: (storedItem.output as { readonly result?: unknown } | undefined)?.result as
+            | McpAppCallToolResult
+            | undefined,
+        }
+      : undefined;
 
   const callTool = useAtomCommand(mcpAppEnvironment.callTool, { reportFailure: false });
   const toolInfo = useAtomCommand(mcpAppEnvironment.toolInfo, { reportFailure: false });
@@ -170,6 +169,21 @@ export function McpAppFrame(props: {
   useEffect(() => {
     latest.current = live;
   });
+
+  // Frame input does not bubble here. An app can refocus itself, so focus
+  // alone cannot exclude activation from input elsewhere in T3.
+  const lastPageInputAt = useRef(Number.NEGATIVE_INFINITY);
+  useEffect(() => {
+    const note = () => {
+      lastPageInputAt.current = performance.now();
+    };
+    if (navigator.userActivation?.isActive) note();
+    const types = ["pointerdown", "pointerup", "touchend", "keydown"] as const;
+    for (const type of types) window.addEventListener(type, note, true);
+    return () => {
+      for (const type of types) window.removeEventListener(type, note, true);
+    };
+  }, []);
 
   useEffect(() => {
     const box = boxRef.current;
@@ -346,7 +360,10 @@ export function McpAppFrame(props: {
         const otherFullscreen = document.querySelector("[data-mcp-app-fullscreen]");
         if (
           mode === "fullscreen" &&
-          (latest.current.props.awaitingUser === true ||
+          (document.activeElement !== frameRef.current ||
+            !navigator.userActivation?.isActive ||
+            performance.now() - lastPageInputAt.current < PAGE_ACTIVATION_MS ||
+            latest.current.props.awaitingUser === true ||
             isConfirmDialogActive() ||
             (otherFullscreen !== null && otherFullscreen !== boxRef.current))
         ) {

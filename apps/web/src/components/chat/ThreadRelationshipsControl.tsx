@@ -12,6 +12,7 @@ import {
   type RuntimeSubagent,
 } from "@t3tools/client-runtime/state/subagentRuntime";
 import { formatSubagentDisplayTitle } from "@t3tools/client-runtime/state/subagent-display";
+import { deriveProviderSubagentStatus } from "@t3tools/client-runtime/state/thread-execution";
 import {
   deriveThreadRelationshipGraph,
   immediateThreadRelationships,
@@ -27,10 +28,11 @@ import {
   resolveLatestMergeBackRun,
 } from "@t3tools/client-runtime/state/thread-workflows";
 import {
+  isOrchestrationV2WorkActive,
+  isProviderNativeSubagentThread,
   NodeId,
   type EnvironmentId,
   type OrchestrationV2Subagent,
-  type OrchestrationV2ThreadProjection,
   type OrchestrationV2ThreadShell,
   type ThreadId,
 } from "@t3tools/contracts";
@@ -55,10 +57,10 @@ import { useArchivedThreadSnapshots } from "../../lib/archivedThreadsState";
 import { buildThreadRouteParams } from "../../threadRoutes";
 import {
   useProjects,
-  useServerConfigs,
   useThreadProjection,
-  useThreadShells,
+  useThreadRelationshipShells,
 } from "../../state/entities";
+import { useEnvironmentProviders } from "../../state/environments";
 import { threadEnvironment } from "../../state/threads";
 import { orchestrationEnvironment } from "../../state/orchestration";
 import { useAtomCommand } from "../../state/use-atom-command";
@@ -78,7 +80,7 @@ import {
 const THREAD_LINEAGE_INITIAL_COUNT = 6;
 const THREAD_LINEAGE_PAGE_COUNT = 12;
 
-export function resolveThreadLineageWindow<Row>(
+function resolveThreadLineageWindow<Row>(
   rows: ReadonlyArray<Row>,
   visibleCount: number,
 ): { readonly visibleRows: ReadonlyArray<Row>; readonly hiddenCount: number } {
@@ -86,7 +88,7 @@ export function resolveThreadLineageWindow<Row>(
   return { visibleRows, hiddenCount: rows.length - visibleRows.length };
 }
 
-export function ThreadLineageRowList(props: {
+function ThreadLineageRowList(props: {
   readonly hiddenCount: number;
   readonly onShowMore: () => void;
   readonly children: ReactNode;
@@ -178,9 +180,9 @@ function currentSubagent<Agent extends RuntimeSubagent>(
   agent: Agent | undefined,
   childThread: OrchestrationV2ThreadShell | null | undefined,
 ): Agent | undefined {
+  if (!agent || !childThread || isOrchestrationV2WorkActive(agent.status)) return agent;
   const liveStatus =
-    childThread?.activityRunStatus ?? (childThread?.status === "queued" ? "queued" : null);
-  if (!agent || !childThread) return agent;
+    childThread.activityRunStatus ?? (childThread.status === "queued" ? "queued" : null);
   const newerRun =
     childThread.latestRunRequestedAt &&
     DateTime.toEpochMillis(childThread.latestRunRequestedAt) >
@@ -205,11 +207,54 @@ function currentSubagent<Agent extends RuntimeSubagent>(
   };
 }
 
-// These lookups and the graph walk every subagent and thread; the panel calls
-// several hooks after them, which would stop the compiler caching them inline.
-function useSubagentLookups(subagents: ReadonlyArray<OrchestrationV2Subagent> | undefined) {
-  "use memo";
-  const projected = subagents ?? [];
+export function ThreadRelationshipsPanel(props: {
+  readonly environmentId: EnvironmentId;
+  readonly threadId: ThreadId;
+}) {
+  const ref = scopeThreadRef(props.environmentId, props.threadId);
+  const projection = useThreadProjection(ref)?.projection ?? null;
+  const providersByEnvironment = useEnvironmentProviders();
+  const relationshipShells = useThreadRelationshipShells(ref);
+  const allProjects = useProjects();
+  const archived = useArchivedThreadSnapshots([props.environmentId]);
+  const archivedShells = archived.snapshots.find(
+    (entry) => entry.environmentId === props.environmentId,
+  )?.snapshot.threads;
+  const currentThread =
+    projection?.thread ??
+    relationshipShells.find((thread) => thread.id === props.threadId) ??
+    archivedShells?.find((thread) => thread.id === props.threadId);
+  const parentThreadId =
+    currentThread?.forkedFrom?.type === "run"
+      ? currentThread.forkedFrom.threadId
+      : currentThread?.lineage.parentThreadId;
+  const parentShell = parentThreadId
+    ? (relationshipShells.find((thread) => thread.id === parentThreadId) ??
+      archivedShells?.find((thread) => thread.id === parentThreadId))
+    : undefined;
+  const parentRef =
+    parentShell && isProviderNativeSubagentThread(parentShell)
+      ? scopeThreadRef(props.environmentId, parentShell.id)
+      : null;
+  const parentProjection = useThreadProjection(parentRef)?.projection;
+  const navigate = useNavigate();
+  const mergeBack = useAtomCommand(threadEnvironment.mergeBack);
+  const stopSession = useAtomCommand(threadEnvironment.stopSession);
+  const interruptTurn = useAtomCommand(threadEnvironment.interruptTurn);
+  const stopWorkflowCommand = useAtomCommand(orchestrationEnvironment.stopWorkflow);
+  const canOperateWorkflow = useAtomValue(
+    orchestrationEnvironment.stopWorkflow.permissionAtom(props.environmentId),
+  );
+  const [busyAction, setBusyAction] = useState<"merge" | "detach" | null>(null);
+  const [stoppingId, setStoppingId] = useState<string | null>(null);
+  // These lookups and the graph walk every subagent and thread, so they sit below
+  // the panel's hooks where the compiler can cache them.
+  const providers = providersByEnvironment.get(props.environmentId);
+  const projects = allProjects.filter((project) => project.environmentId === props.environmentId);
+  const parentNativeStatus = parentProjection
+    ? deriveProviderSubagentStatus(parentProjection)?.status
+    : undefined;
+  const projected = projection?.subagents ?? [];
   const runtimeSubagents = projectedSubagentsToRuntime(projected);
   const byId = new Map(runtimeSubagents.map((agent) => [agent.id, agent]));
   const subagentsByThreadId = new Map(
@@ -234,57 +279,12 @@ function useSubagentLookups(subagents: ReadonlyArray<OrchestrationV2Subagent> | 
   const workflowGroupsById = new Map(
     deriveWorkflowGroups(runtimeSubagents).map((group) => [group.workflow.id, group]),
   );
-  return { subagentsByThreadId, workflowGroupsById };
-}
-
-function useThreadRelationshipGraph(
-  threadShells: ReturnType<typeof useThreadShells>,
-  archivedShells: ReadonlyArray<OrchestrationV2ThreadShell> | undefined,
-  projection: OrchestrationV2ThreadProjection | null,
-  environmentId: EnvironmentId,
-) {
-  "use memo";
   const shells: ReadonlyArray<OrchestrationV2ThreadShell> = [
-    ...threadShells
-      .filter((thread) => thread.environmentId === environmentId)
-      .map((thread) => thread.source),
+    ...relationshipShells,
     ...(archivedShells ?? []),
   ];
-  return deriveThreadRelationshipGraph({ threads: shells, projection });
-}
-
-export function ThreadRelationshipsPanel(props: {
-  readonly environmentId: EnvironmentId;
-  readonly threadId: ThreadId;
-}) {
-  const ref = scopeThreadRef(props.environmentId, props.threadId);
-  const projection = useThreadProjection(ref)?.projection ?? null;
-  const providers = useServerConfigs().get(props.environmentId)?.providers;
-  const { subagentsByThreadId, workflowGroupsById } = useSubagentLookups(projection?.subagents);
-  const threadShells = useThreadShells();
-  const projects = useProjects().filter((project) => project.environmentId === props.environmentId);
-  const archived = useArchivedThreadSnapshots([props.environmentId]);
-  const archivedShells = archived.snapshots.find(
-    (entry) => entry.environmentId === props.environmentId,
-  )?.snapshot.threads;
-  const graph = useThreadRelationshipGraph(
-    threadShells,
-    archivedShells,
-    projection,
-    props.environmentId,
-  );
-  const currentThread = projection?.thread ?? graph.nodes.get(props.threadId)?.thread;
+  const graph = deriveThreadRelationshipGraph({ threads: shells, projection });
   const currentProject = projects.find((project) => project.id === currentThread?.projectId);
-  const navigate = useNavigate();
-  const mergeBack = useAtomCommand(threadEnvironment.mergeBack);
-  const stopSession = useAtomCommand(threadEnvironment.stopSession);
-  const interruptTurn = useAtomCommand(threadEnvironment.interruptTurn);
-  const stopWorkflowCommand = useAtomCommand(orchestrationEnvironment.stopWorkflow);
-  const canOperateWorkflow = useAtomValue(
-    orchestrationEnvironment.stopWorkflow.permissionAtom(props.environmentId),
-  );
-  const [busyAction, setBusyAction] = useState<"merge" | "detach" | null>(null);
-  const [stoppingId, setStoppingId] = useState<string | null>(null);
   const latestMergeBackRun = projection === null ? null : resolveLatestMergeBackRun(projection);
   const mergeTargetThreadId = resolveMergeBackTargetThreadId(projection);
   const relationshipRows = orderWebThreadLineageRows({
@@ -366,16 +366,13 @@ export function ThreadRelationshipsPanel(props: {
 
   const stopSubagent = async (
     childThreadId: ThreadId,
-    agent: Pick<OrchestrationV2Subagent, "id" | "origin" | "threadId">,
+    agent: Pick<OrchestrationV2Subagent, "id" | "threadId">,
   ) => {
     if (stoppingId !== null) return;
     setStoppingId(childThreadId);
     const result = await interruptTurn({
       environmentId: props.environmentId,
-      input:
-        agent.origin === "provider_native"
-          ? { threadId: agent.threadId, subagentId: agent.id }
-          : { threadId: childThreadId },
+      input: { threadId: agent.threadId, subagentId: agent.id },
     });
     setStoppingId(null);
     if (result._tag === "Failure") {
@@ -440,7 +437,10 @@ export function ThreadRelationshipsPanel(props: {
               const isSubagent = edge.kind === "subagent";
               const isMergeTarget = threadId === mergeTargetThreadId;
               const isParent = isParentThreadRelationship(edge, props.threadId);
-              const rowStatus = threadRelationshipRowStatus(graph, { threadId, edge });
+              const rowStatus =
+                (isParent && threadId === parentRef?.threadId
+                  ? (node?.thread?.activityRunStatus ?? parentNativeStatus)
+                  : undefined) ?? threadRelationshipRowStatus(graph, { threadId, edge });
               const RelationshipIcon = isParent
                 ? CornerLeftUpIcon
                 : isSubagent

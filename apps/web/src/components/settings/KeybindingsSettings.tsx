@@ -52,6 +52,7 @@ import { Toggle } from "../ui/toggle";
 import { toastManager } from "../ui/toast";
 import {
   buildKeybindingRows,
+  filterKeybindingRows,
   buildKeybindingCommandOptions,
   buildWhenVariableOptions,
   commandLabel,
@@ -741,7 +742,9 @@ function useKeybindingRowEditor({
       setDraft({ keyDraft: row.key, isRecording: false });
       return;
     }
-    const next = keybindingFromKeyboardEvent(event.nativeEvent, navigator.platform);
+    const next = keybindingFromKeyboardEvent(event.nativeEvent, navigator.platform, {
+      layoutCharacter: true,
+    });
     if (!next) return;
     setDraft({ keyDraft: next, isRecording: false });
   };
@@ -1051,7 +1054,9 @@ function useNewKeybindingDraft({
       setDraft({ keyDraft: "", isRecording: false });
       return;
     }
-    const next = keybindingFromKeyboardEvent(event.nativeEvent, navigator.platform);
+    const next = keybindingFromKeyboardEvent(event.nativeEvent, navigator.platform, {
+      layoutCharacter: true,
+    });
     if (!next) return;
     setDraft({ keyDraft: next, isRecording: false });
   };
@@ -1260,25 +1265,6 @@ function BrowserKeybindingNotice() {
   );
 }
 
-// The panel calls hooks after these, so they would lose their caches inline. Separate hooks
-// keep the command options from rebuilding on every search keystroke.
-function useKeybindings(
-  serverKeybindings: Parameters<typeof mergeWithDefaultKeybindings>[0] | undefined,
-) {
-  "use memo";
-  const keybindings = mergeWithDefaultKeybindings(serverKeybindings ?? []);
-  return { keybindings, commandOptions: buildKeybindingCommandOptions(keybindings) };
-}
-
-function useKeybindingRows(
-  keybindings: ReturnType<typeof mergeWithDefaultKeybindings>,
-  query: string,
-) {
-  "use memo";
-  const rows = buildKeybindingRows(keybindings, query);
-  return { rows, groups: groupKeybindingRows(rows), anchorIds: keybindingAnchorIds(rows) };
-}
-
 function keybindingAnchorIds(rows: ReturnType<typeof buildKeybindingRows>) {
   const ids = new Map<string, string>();
   const seen = new Set<KeybindingCommand>();
@@ -1288,6 +1274,18 @@ function keybindingAnchorIds(rows: ReturnType<typeof buildKeybindingRows>) {
     ids.set(row.id, keybindingSearchAnchorId(row.command));
   }
   return ids;
+}
+
+// Rows come from a hook so they are cached on the server keybindings alone. Built
+// inline, the compiler joins them to the query's cache scope (filtering might
+// mutate them), and every keystroke rebuilds and re-renders every row.
+function useKeybindingCatalog() {
+  const serverKeybindings = useSettingsScope().environment?.serverConfig?.keybindings;
+  const merged = mergeWithDefaultKeybindings(serverKeybindings ?? []);
+  return {
+    commandOptions: buildKeybindingCommandOptions(merged),
+    allRows: buildKeybindingRows(merged),
+  };
 }
 
 export function KeybindingsSettingsPanel() {
@@ -1300,9 +1298,6 @@ export function KeybindingsSettingsPanel() {
   const canWriteSettings =
     connectedEnvironments.length > 0 &&
     connectedEnvironments.every((target) => writableIds.has(target.environmentId));
-  const { keybindings, commandOptions } = useKeybindings(
-    primaryEnvironment?.serverConfig?.keybindings,
-  );
   const keybindingsConfigPath = primaryEnvironment?.serverConfig?.keybindingsConfigPath ?? null;
   const availableEditors = primaryEnvironment?.serverConfig?.availableEditors ?? [];
   const upsertKeybinding = useAtomCommand(serverEnvironment.upsertKeybinding, {
@@ -1319,7 +1314,6 @@ export function KeybindingsSettingsPanel() {
   const searchInputRef = useRef<HTMLInputElement>(null);
   const [savingCommand, setSavingCommand] = useState<KeybindingCommand | null>(null);
   const [isAddingBinding, setIsAddingBinding] = useState(false);
-  const { rows, groups, anchorIds } = useKeybindingRows(keybindings, query);
   const searchTargetId = useLocation({ select: (location) => location.hash.replace(/^#/, "") });
   const [handledSearchTargetId, setHandledSearchTargetId] = useState(searchTargetId);
 
@@ -1328,6 +1322,10 @@ export function KeybindingsSettingsPanel() {
     if (searchTargetId.startsWith("keybinding-")) setQuery("");
   }
   const whenVariables = buildWhenVariableOptions();
+  const { commandOptions, allRows } = useKeybindingCatalog();
+  const rows = filterKeybindingRows(allRows, query);
+  const groups = groupKeybindingRows(rows);
+  const anchorIds = keybindingAnchorIds(rows);
 
   const openKeybindingsFile = () => {
     if (
@@ -1437,7 +1435,7 @@ export function KeybindingsSettingsPanel() {
   const cancelAdd = () => setIsAddingBinding(false);
 
   const rowActions: KeybindingRowActions = {
-    allRows: rows,
+    allRows,
     variables: whenVariables,
     onSave: saveKeybinding,
     onReset: resetKeybinding,
@@ -1493,7 +1491,7 @@ export function KeybindingsSettingsPanel() {
           <SettingsGroup>
             <NewKeybindingSettingsRow
               commandOptions={commandOptions}
-              allRows={rows}
+              allRows={allRows}
               variables={whenVariables}
               isSaving={savingCommand !== null}
               onSave={saveKeybinding}
