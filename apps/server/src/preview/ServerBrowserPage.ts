@@ -509,6 +509,8 @@ type SnapshotInput = {
   readonly cdp: CDPSession;
   /** Headless pages render at the scale the server set; a desktop page at its display's. */
   readonly renderScale: number | "display";
+  /** Defaults to true. False returns the snapshot without capturing a screenshot. */
+  readonly includeScreenshot?: boolean;
   readonly consoleEntries: ReadonlyArray<PreviewAutomationConsoleEntry>;
   readonly networkEntries: ReadonlyArray<PreviewAutomationNetworkEntry>;
   readonly actionTimeline: PreviewAutomationSnapshot["actionTimeline"];
@@ -554,7 +556,9 @@ const capture = async (
         "url" | "title" | "loading" | "visibleText" | "interactiveElements"
       >
     >,
-    captureViewport(input.page, input.cdp, { format: "png", scale, viewport, offset }),
+    input.includeScreenshot === false
+      ? Promise.resolve(null)
+      : captureViewport(input.page, input.cdp, { format: "png", scale, viewport, offset }),
   ]);
   void pageAndScreenshot.catch(constVoid);
   // Leaves time for the second read; a frame that never loads holds the tree until then.
@@ -601,11 +605,14 @@ const capture = async (
     consoleEntries: [...input.consoleEntries],
     networkEntries: [...input.networkEntries],
     actionTimeline: [...input.actionTimeline],
-    screenshot: {
-      mimeType: "image/png",
-      data,
-      ...pngSize(data),
-    },
+    screenshot:
+      data === null
+        ? null
+        : {
+            mimeType: "image/png",
+            data,
+            ...pngSize(data),
+          },
   };
 };
 

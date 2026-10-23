@@ -245,6 +245,45 @@ describe("server browser element refs", () => {
     await ServerBrowserPage.click(page, { selector: 'button[data-example=" >> aria-ref=e1"]' });
     expect(await page.locator("button").textContent()).toBe("saved");
   });
+
+  it("skips the screenshot capture when includeScreenshot is false", async () => {
+    await page.setContent("<button>hi</button>");
+    let captures = 0;
+    const countingCdp = new Proxy(cdp, {
+      get(target, property) {
+        const value = Reflect.get(target, property, target);
+        if (property === "send") {
+          return (method: string, ...args: Array<unknown>) => {
+            if (method === "Page.captureScreenshot") captures += 1;
+            return (target.send as (...sendArgs: Array<unknown>) => unknown).apply(target, [
+              method,
+              ...args,
+            ]);
+          };
+        }
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const base = {
+      page,
+      cdp: countingCdp,
+      renderScale: 1 as const,
+      consoleEntries: [],
+      networkEntries: [],
+      actionTimeline: [],
+    };
+    const withScreenshot = await ServerBrowserPage.snapshot(base);
+    expect(withScreenshot.screenshot).not.toBeNull();
+    expect(captures).toBe(1);
+
+    const withoutScreenshot = await ServerBrowserPage.snapshot({
+      ...base,
+      includeScreenshot: false,
+    });
+    expect(withoutScreenshot.screenshot).toBeNull();
+    expect(captures).toBe(1);
+    expect(String(withoutScreenshot.accessibilityTree)).toContain("hi");
+  });
 });
 
 describe("server browser drag", () => {
