@@ -26,7 +26,11 @@ export class ThreadSearchError extends Schema.TaggedError<ThreadSearchError>()(
   }
 }
 
-const SearchRequest = Schema.Struct({ pattern: Schema.String, limit: Schema.Int });
+const SearchRequest = Schema.Struct({
+  pattern: Schema.String,
+  ftsPattern: Schema.NullOr(Schema.String),
+  limit: Schema.Int,
+});
 const SearchRow = Schema.Struct({
   threadId: ThreadId,
   projectId: ProjectId,
@@ -37,6 +41,20 @@ const SearchRow = Schema.Struct({
 
 function escapeLikePattern(value: string): string {
   return value.replaceAll("!", "!!").replaceAll("%", "!%").replaceAll("_", "!_");
+}
+
+// The trigram index only prunes candidates; the LIKE predicate below stays
+// the exact filter, so results are unchanged. Pruning is restricted to
+// letter/digit/space queries whose every term has at least three
+// characters: LIKE folds ASCII case only while the trigram tokenizer folds
+// more broadly, the tokenizer drops punctuation and short terms (which
+// could prune away true matches), and shorter text cannot form a trigram.
+// Everything else keeps the plain scan.
+function ftsPatternFor(query: string): string | null {
+  if (!/^[A-Za-z0-9 ]+$/.test(query)) return null;
+  const terms = query.split(" ").filter((term) => term.length > 0);
+  if (terms.length === 0 || terms.some((term) => term.length < 3)) return null;
+  return `"${query}"`;
 }
 
 function foldAsciiCase(value: string): string {
@@ -75,7 +93,7 @@ export const make = Effect.gen(function* () {
   const searchRows = SqlSchema.findAll({
     Request: SearchRequest,
     Result: SearchRow,
-    execute: ({ pattern, limit }) => sql`
+    execute: ({ pattern, ftsPattern, limit }) => sql`
       WITH candidate AS (
         SELECT
           threads.thread_id,
@@ -96,6 +114,15 @@ export const make = Effect.gen(function* () {
           AND messages.streaming = 0
           AND messages.role IN ('user', 'assistant')
           AND json_extract(messages.payload_json, '$.text') LIKE ${pattern} ESCAPE '!'
+          ${
+            ftsPattern === null
+              ? sql``
+              : sql`AND messages.message_id IN (
+                  SELECT message_id
+                  FROM orchestration_v2_projection_message_search
+                  WHERE orchestration_v2_projection_message_search MATCH ${ftsPattern}
+                )`
+          }
       ),
       ranked AS (
         SELECT
@@ -136,6 +163,7 @@ export const make = Effect.gen(function* () {
         .withTransaction(
           searchRows({
             pattern: `%${escapeLikePattern(input.query)}%`,
+            ftsPattern: ftsPatternFor(input.query),
             limit: input.limit ?? 50,
           }),
         )
