@@ -176,6 +176,45 @@ it.layer(layerTest)("ThreadSearch", (it) => {
       );
       assert.lengthOf((yield* search.search({ query: "needle", limit: 1 })).matches, 1);
       assert.deepEqual((yield* search.search({ query: "ne%le" })).matches, []);
+      // Mid-word substrings take the trigram path; two-character queries keep
+      // the LIKE scan. Both must return the LIKE results above.
+      for (const query of ["eedl", "ne"]) {
+        assert.deepEqual(
+          (yield* search.search({ query, limit: 20 })).matches.map((match) => match.threadId),
+          [both, assistantOnly],
+        );
+      }
+    }),
+  );
+
+  it.effect("keeps LIKE semantics for punctuation, emoji, and non-ASCII queries", () =>
+    Effect.gen(function* () {
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const search = yield* ThreadSearch.ThreadSearch;
+      const project = ProjectId.make("project:search-semantics");
+      const threadId = ThreadId.make("thread:semantics");
+      yield* createProject(project);
+      yield* Effect.forEach(
+        [
+          thread(threadId, project),
+          message(threadId, "accent", "user", "café résumé", { minute: 1 }),
+          message(threadId, "symbols", "assistant", "100% coverage_boost done", { minute: 2 }),
+          message(threadId, "emoji", "user", "a🎉b party", { minute: 3 }),
+        ],
+        projections.apply,
+        { discard: true },
+      );
+
+      const threadIds = (query: string) =>
+        Effect.map(search.search({ query }), (result) =>
+          result.matches.map((match) => match.threadId),
+        );
+      assert.deepEqual(yield* threadIds("café"), [threadId]);
+      // LIKE folds ASCII case only, so É does not match é on either path.
+      assert.deepEqual(yield* threadIds("CAFÉ"), []);
+      assert.deepEqual(yield* threadIds("100%"), [threadId]);
+      assert.deepEqual(yield* threadIds("coverage_boost"), [threadId]);
+      assert.deepEqual(yield* threadIds("🎉"), [threadId]);
     }),
   );
 });
