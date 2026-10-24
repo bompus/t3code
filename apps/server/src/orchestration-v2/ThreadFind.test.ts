@@ -813,4 +813,37 @@ describe("V2 history materialization", () => {
       assert.deepEqual(sizes, [1, 1, 75, 3]);
     }).pipe(Effect.provide(layerTest)),
   );
+
+  it.effect("keeps cached timeline reads current as the thread and its fork source change", () =>
+    Effect.gen(function* () {
+      const projection = yield* setup;
+      const parent = ThreadId.make("thread:parent");
+      const parentRun = RunId.make("run:parent");
+      yield* commit([thread(parent, projectId), run(parent, parentRun)]);
+      yield* putItems([{ ...item("p1", 1, "one", "assistant_message", parent), runId: parentRun }]);
+      const child = thread(threadId, projectId);
+      if (child.type !== "thread.created") return;
+      yield* commit([
+        {
+          ...child,
+          id: EventId.make("child:fork"),
+          type: "thread.metadata-updated",
+          payload: {
+            ...child.payload,
+            forkedFrom: { type: "run", threadId: parent, runId: parentRun },
+          },
+        },
+      ]);
+      yield* putItems([item("c1", 1, "local")]);
+      const totalItems = projection
+        .getTimelinePage(threadId, { view: "activity", limit: 100 })
+        .pipe(Effect.map((page) => page.totalItems));
+      const initial = yield* totalItems;
+      assert.equal(yield* totalItems, initial);
+      yield* putItems([item("c2", 2, "local again")]);
+      assert.equal(yield* totalItems, initial + 1);
+      yield* putItems([{ ...item("p2", 2, "two", "assistant_message", parent), runId: parentRun }]);
+      assert.equal(yield* totalItems, initial + 2);
+    }).pipe(Effect.provide(layerTest)),
+  );
 });

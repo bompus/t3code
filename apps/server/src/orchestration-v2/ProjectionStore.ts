@@ -99,6 +99,7 @@ import {
   THREAD_HISTORY_PAGE_POLICY,
   OLDER_THREAD_USER_TURN_LIMIT,
 } from "./threadHistoryPaging.ts";
+import { makeThreadRevisionReader } from "./threadRevision.ts";
 
 export class ProjectionStoreApplyEventError extends Schema.TaggedError<ProjectionStoreApplyEventError>()(
   "ProjectionStoreApplyEventError",
@@ -5331,17 +5332,17 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       readonly item: TimelineIndexItem;
       readonly synthetic?: OrchestrationV2TurnItem;
     };
+    type TimelineIndex = {
+      readonly records: ProjectionRecords<"runs" | "attempts">;
+      readonly local: ReadonlyArray<TimelineIndexRow>;
+      readonly visible: ReadonlyArray<TimelineIndexRow>;
+    };
     const readTimelineIndex: (
       threadId: ThreadId,
       seen: ReadonlySet<ThreadId>,
-    ) => Effect.Effect<
-      {
-        readonly records: ProjectionRecords<"runs" | "attempts">;
-        readonly local: ReadonlyArray<TimelineIndexRow>;
-        readonly visible: ReadonlyArray<TimelineIndexRow>;
-      },
-      ProjectionStoreV2Error
-    > = Effect.fn("ProjectionStore.readTimelineIndex")(
+    ) => Effect.Effect<TimelineIndex, ProjectionStoreV2Error> = Effect.fn(
+      "ProjectionStore.readTimelineIndex",
+    )(
       function* (threadId: ThreadId, seen: ReadonlySet<ThreadId>) {
         const records = yield* getThreadRecords(threadId, ["runs", "attempts"]);
         const rows = yield* sql<{
@@ -5443,6 +5444,40 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       readTimelineIndex(threadId, new Set()).pipe(Effect.map((index) => index.visible)),
     );
 
+    // Every history page needs the whole thread's index, so scrolling back through a long
+    // thread would rebuild it once per page. Entries are valid while the newest event of the
+    // thread and its fork sources is unchanged; a revision of 0 means no events to compare.
+    // A projection rebuild appends no events, so it needs a fresh store.
+    const readThreadRevision = yield* makeThreadRevisionReader;
+    const timelineIndexes = new Map<
+      ThreadId,
+      { readonly sequence: number; readonly index: TimelineIndex }
+    >();
+    const TIMELINE_INDEX_CACHE_CAPACITY = 4;
+    const readCurrentTimelineIndex = Effect.fn("ProjectionStore.readCurrentTimelineIndex")(
+      function* (threadId: ThreadId) {
+        const sequence = yield* readThreadRevision([threadId]).pipe(
+          Effect.mapError((cause) => new ProjectionStoreReadError({ threadId, cause })),
+        );
+        const cached = timelineIndexes.get(threadId);
+        if (cached !== undefined && cached.sequence === sequence && sequence > 0) {
+          timelineIndexes.delete(threadId);
+          timelineIndexes.set(threadId, cached);
+          return cached.index;
+        }
+        const index = yield* readTimelineIndex(threadId, new Set());
+        timelineIndexes.delete(threadId);
+        if (sequence > 0) {
+          timelineIndexes.set(threadId, { sequence, index });
+          if (timelineIndexes.size > TIMELINE_INDEX_CACHE_CAPACITY) {
+            const oldest = timelineIndexes.keys().next().value;
+            if (oldest !== undefined) timelineIndexes.delete(oldest);
+          }
+        }
+        return index;
+      },
+    );
+
     const getThreadHistoryPage: ProjectionStoreV2Shape["getThreadHistoryPage"] = (
       threadId,
       cursor,
@@ -5452,7 +5487,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       sql
         .withTransaction(
           Effect.gen(function* () {
-            const index = yield* readTimelineIndex(threadId, new Set());
+            const index = yield* readCurrentTimelineIndex(threadId);
             if (index.records.thread.deletedAt !== null)
               return yield* new ProjectionStoreThreadNotFoundError({ threadId });
             const revisions = yield* sql<{
@@ -5550,7 +5585,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       sql
         .withTransaction(
           Effect.gen(function* () {
-            const index = yield* readTimelineIndex(threadId, new Set());
+            const index = yield* readCurrentTimelineIndex(threadId);
             const matching = index.visible
               .map((row, position) => ({ ...row, position }))
               .filter((row) =>
