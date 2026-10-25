@@ -65,6 +65,26 @@ it.each([
   ).toBe(program);
 });
 
+it("hands the launcher the file the manager appends the service output to", () => {
+  const plan = {
+    program: ["/home/theo/.t3/runtime/versions/1.2.3/t3", "__service-launcher"],
+    baseDir: "/home/theo/.t3",
+    logPath: "/home/theo/T3 Logs/100%/boot-service.log",
+    unitPath: "/home/theo/.config/systemd/user/t3code.service",
+  };
+
+  const unit = BootService.renderBootServiceUnit(plan);
+  expect(unit).toContain(
+    '\nEnvironment=T3_BOOT_SERVICE_LOG="/home/theo/T3 Logs/100%%/boot-service.log"\n',
+  );
+  expect(unit).toContain("StandardOutput=append:/home/theo/T3 Logs/100%%/boot-service.log");
+  expect(
+    BootService.renderBootServicePlist(plan, { homeDir: "/Users/theo", environmentPath: "" }),
+  ).toContain(
+    "<key>T3_BOOT_SERVICE_LOG</key>\n    <string>/home/theo/T3 Logs/100%/boot-service.log</string>",
+  );
+});
+
 const macInstallerPath =
   "/opt/homebrew/bin:/Users/theo/.npm-global/bin:/Users/theo/.nvm/versions/node/v22.16.0/bin:/usr/bin:/bin";
 

@@ -17,6 +17,7 @@ import type {
   ServiceUpdateRecord,
 } from "./cloud/serviceProtocol.ts";
 import {
+  BOOT_SERVICE_LOG_ENV,
   compareExactServiceVersions,
   decodeServiceLauncherChildMessage,
   isExactServiceVersion,
@@ -36,6 +37,8 @@ const HANDOFF_DELAY_MS = 2_000;
  */
 const PREPARED_TIMEOUT_MS = 30 * 60_000;
 const TERMINATE_GRACE_MS = 5_000;
+const SERVICE_LOG_MAX_BYTES = 16 * 1024 * 1024;
+const SERVICE_LOG_CHECK_INTERVAL_MS = 10 * 60_000;
 // Match contracts' SERVER_EXIT_CODE_STATE_DIR_OWNED without depending on Effect.
 const STATE_DIR_OWNED_EXIT_CODE = 78;
 
@@ -87,6 +90,7 @@ const MANAGED_SERVICE_ENV_NAMES = new Set([
   "PATH",
   "T3CODE_HOME",
   "T3_BOOT_SERVICE_UNIT",
+  BOOT_SERVICE_LOG_ENV,
   SERVICE_LAUNCHER_CONTEXT_ENV,
 ]);
 
@@ -429,6 +433,22 @@ async function terminateChild(
   }
 }
 
+/**
+ * systemd and launchd append the service's output to the boot-service log through a descriptor
+ * they keep open, so a rename would leave them writing to the renamed file. Keep one older copy
+ * and empty the live file in place instead. Output written between the copy and the truncate is
+ * lost, as with logrotate's copytruncate.
+ */
+export async function capServiceLog(logPath: string, maxBytes: number): Promise<void> {
+  const stats = await NodeFSP.stat(logPath).catch((cause: NodeJS.ErrnoException) => {
+    if (cause.code === "ENOENT") return undefined;
+    throw cause;
+  });
+  if (stats === undefined || stats.size <= maxBytes) return;
+  await NodeFSP.copyFile(logPath, `${logPath}.1`);
+  await NodeFSP.truncate(logPath, 0);
+}
+
 const stopMarkerPath = (baseDir: string) =>
   NodePath.join(baseDir, "runtime", SERVICE_STOP_MARKER_FILE);
 const restartPendingPath = (baseDir: string) =>
@@ -468,10 +488,24 @@ export class Launcher {
     const onSigint = () => void this.stop("SIGINT");
     process.once("SIGTERM", onSigterm);
     process.once("SIGINT", onSigint);
+    const logPath = this.#environment[BOOT_SERVICE_LOG_ENV];
+    const capLog = () =>
+      logPath === undefined
+        ? Promise.resolve()
+        : capServiceLog(logPath, SERVICE_LOG_MAX_BYTES).catch((cause: unknown) => {
+            process.stderr.write(
+              `[service-launcher] Could not cap the boot-service log: ${String(cause)}\n`,
+            );
+          });
+    const initialCap = capLog();
+    const logTimer = setInterval(capLog, SERVICE_LOG_CHECK_INTERVAL_MS);
+    logTimer.unref();
     try {
       this.#enqueue(() => this.#recover());
       await this.#completion.promise;
     } finally {
+      clearInterval(logTimer);
+      await initialCap;
       process.off("SIGTERM", onSigterm);
       process.off("SIGINT", onSigint);
     }
