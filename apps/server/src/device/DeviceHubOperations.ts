@@ -13,6 +13,8 @@ import type { DeviceHostReady, DeviceOperations, HostDevice } from "./DeviceHost
 
 const BOOT_TIMEOUT = Duration.minutes(3);
 const SCREENSHOT_TIMEOUT = Duration.seconds(20);
+// Shutdown waits on the device to finish quitting, which can take longer than a hub query.
+const SHUTDOWN_TIMEOUT = Duration.minutes(1);
 
 const HubDevice = Schema.Struct({
   id: Schema.String,
@@ -186,7 +188,9 @@ export const makeDeviceHubOperations = (options: {
     function* (device) {
       const postShutdown = (path: string, body: Record<string, string>) =>
         postJson(path, body, "shutdown").pipe(
-          Effect.flatMap((request) => hubJson(request, HubActionResult, "shutdown")),
+          Effect.flatMap((request) =>
+            hubJson(request, HubActionResult, "shutdown", SHUTDOWN_TIMEOUT),
+          ),
           Effect.flatMap((result) =>
             result.ok
               ? Effect.void
