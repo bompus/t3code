@@ -230,6 +230,16 @@ export const isLiveCallerShell = (
       false));
 
 /**
+ * The app writes attached-thread context and `t3-context://` links as
+ * `thread_<id>`, and agents pass that value back verbatim. No stored id carries
+ * the prefix, so strip it before any lookup instead of failing a live thread.
+ */
+export const threadRefId = (threadId: ThreadId): ThreadId => {
+  const prefix = "thread_";
+  return threadId.startsWith(prefix) ? ThreadId.make(threadId.slice(prefix.length)) : threadId;
+};
+
+/**
  * Threads an agent starts over MCP are `mcp:<uuid>`, and agents often paste the
  * bare uuid. The id is never rewritten, so permission checks keyed on it still
  * hold; the miss only names a live thread the caller could read by its full id.
@@ -1193,13 +1203,14 @@ const make = Effect.gen(function* () {
   const loadTargetThread = Effect.fn("OrchestratorMcpService.loadTargetThread")(function* (
     threadId: ThreadId,
   ) {
+    const targetId = threadRefId(threadId);
     const shell = yield* threadManagement
-      .getThreadShell(threadId)
+      .getThreadShell(targetId)
       .pipe(Effect.mapError(threadManagementFailure));
     if (shell === null || shell.deletedAt !== null) {
-      return yield* threadNotFound(threadManagement, threadId, `Thread ${threadId} was not found.`);
+      return yield* threadNotFound(threadManagement, targetId, `Thread ${targetId} was not found.`);
     }
-    return yield* loadProjectThread(shell.projectId, threadId);
+    return yield* loadProjectThread(shell.projectId, targetId);
   });
 
   const loadScopedThread = Effect.fn("OrchestratorMcpService.loadScopedThread")(function* (
@@ -1208,7 +1219,7 @@ const make = Effect.gen(function* () {
   ) {
     const caller = yield* loadCaller(scope);
     const target =
-      caller.parent !== undefined && threadId === caller.parent.thread.id
+      caller.parent !== undefined && threadRefId(threadId) === caller.parent.thread.id
         ? caller.parent
         : yield* loadTargetThread(threadId);
     return { ...caller, target } as const;
@@ -1265,18 +1276,19 @@ const make = Effect.gen(function* () {
     threadId: ThreadId,
   ) {
     const { parent } = yield* loadCaller(scope);
+    const targetId = threadRefId(threadId);
     const shell = yield* threadManagement
-      .getThreadShell(threadId)
+      .getThreadShell(targetId)
       .pipe(Effect.mapError(threadManagementFailure));
     if (shell === null || shell.deletedAt !== null) {
       return yield* threadNotFound(
         threadManagement,
-        threadId,
-        `Thread ${threadId} is no longer available.`,
+        targetId,
+        `Thread ${targetId} is no longer available.`,
       );
     }
     const target = yield* threadManagement
-      .getProjectThreadRecords({ projectId: shell.projectId, threadId }, [
+      .getProjectThreadRecords({ projectId: shell.projectId, threadId: targetId }, [
         "runs",
         "runtimeRequests",
         "contextTransfers",

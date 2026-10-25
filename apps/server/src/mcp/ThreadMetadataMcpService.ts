@@ -16,7 +16,7 @@ import * as Layer from "effect/Layer";
 
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
 import type { McpInvocationScope } from "./McpInvocationContext.ts";
-import { threadNotFound } from "./OrchestratorMcpService.ts";
+import { threadNotFound, threadRefId } from "./OrchestratorMcpService.ts";
 
 export class ThreadMetadataMcpService extends Context.Service<
   ThreadMetadataMcpService,
@@ -150,13 +150,14 @@ const make = Effect.gen(function* () {
       );
     }
 
-    const threadId = input.threadId ?? scope.thread?.threadId;
-    if (threadId === undefined) {
+    const requestedThreadId = input.threadId ?? scope.thread?.threadId;
+    if (requestedThreadId === undefined) {
       return yield* failure(
         "target_required",
         "Pass threadId: this MCP client is not running inside a T3 thread.",
       );
     }
+    const threadId = threadRefId(requestedThreadId);
     const shell = yield* threadManagement
       .getThreadShell(threadId)
       .pipe(

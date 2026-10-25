@@ -2520,14 +2520,14 @@ describe("OrchestratorMcpService thread lookup", () => {
         ),
       ),
     );
-  const failuresFor = (shells: ReadonlyArray<OrchestrationV2ThreadShell>) =>
+  const failuresFor = (shells: ReadonlyArray<OrchestrationV2ThreadShell>, ref: ThreadId = bareId) =>
     Effect.gen(function* () {
       const sent = yield* Ref.make(0);
       return yield* Effect.gen(function* () {
         const mcp = yield* OrchestratorMcpService.OrchestratorMcpService;
-        const read = yield* mcp.readThread(client, { threadId: bareId }).pipe(Effect.flip);
+        const read = yield* mcp.readThread(client, { threadId: ref }).pipe(Effect.flip);
         const send = yield* mcp
-          .sendToThread(client, { threadId: bareId, message: "hello" })
+          .sendToThread(client, { threadId: ref, message: "hello" })
           .pipe(Effect.flip);
         return { read, send, sends: yield* Ref.get(sent) };
       }).pipe(Effect.provide(service(shells, sent)));
@@ -2553,6 +2553,32 @@ describe("OrchestratorMcpService thread lookup", () => {
       assert.equal(send.message, `Thread ${bareId} was not found.`);
     }),
   );
+
+  it.effect("strips an attached-thread reference prefix before the lookup", () =>
+    Effect.gen(function* () {
+      const { read, send } = yield* failuresFor([launched], ThreadId.make(`thread_${bareId}`));
+      for (const error of [read, send]) {
+        assert.equal(error.code, "thread_not_found");
+        // The prefix is gone, so the mcp: fallback now names the live thread.
+        assert.include(error.message, `mcp:${bareId}`);
+        assert.isTrue(!error.message.includes("thread_mcp:"));
+      }
+    }),
+  );
+
+  it.effect("names a prefixed id that matches nothing by its bare id", () =>
+    Effect.gen(function* () {
+      const { read } = yield* failuresFor([], ThreadId.make(`thread_${bareId}`));
+      assert.equal(read.message, `Thread ${bareId} is no longer available.`);
+    }),
+  );
+
+  it("strips only a leading reference prefix", () => {
+    assert.equal(OrchestratorMcpService.threadRefId(ThreadId.make(`thread_${bareId}`)), bareId);
+    assert.equal(OrchestratorMcpService.threadRefId(bareId), bareId);
+    const mcpId = ThreadId.make(`mcp:${bareId}`);
+    assert.equal(OrchestratorMcpService.threadRefId(mcpId), mcpId);
+  });
 
   it.effect("does not name an mcp: thread that was deleted", () =>
     Effect.gen(function* () {

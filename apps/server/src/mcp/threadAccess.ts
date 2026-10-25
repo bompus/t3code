@@ -134,7 +134,7 @@ export const resolveProjectId = (context: Caller, projectId: ProjectId | undefin
 
 const resolveThreadId = (context: Caller, threadId: ThreadId | undefined) =>
   threadId !== undefined
-    ? Effect.succeed(threadId)
+    ? Effect.succeed(OrchestrationMcp.threadRefId(threadId))
     : context.caller !== undefined
       ? Effect.succeed(context.caller.id)
       : Effect.fail(
