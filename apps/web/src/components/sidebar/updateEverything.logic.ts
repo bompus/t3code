@@ -19,6 +19,8 @@ export interface UpdateEverythingMachine {
   } | null;
   readonly connected: boolean;
   readonly hostedByThisApp: boolean;
+  /** The desktop app started this server over SSH and relaunches it on its own version at every connect. */
+  readonly desktopRelaunched: boolean;
   readonly canMaintain: boolean;
   readonly updateState: ServerUpdateState;
 }
@@ -94,7 +96,11 @@ export function collectServerUpdateTargets(
     const selfUpdate = resolveServerSelfUpdateCapability(config);
     const desktopAppUpdate = supportsDesktopAppUpdate(config);
     if (selfUpdate === null) {
-      skip("needs a manual update");
+      skip(
+        machine.desktopRelaunched
+          ? "updates when the desktop app reconnects"
+          : "needs a manual update",
+      );
       continue;
     }
     if (selfUpdate === "desktop-managed" && !desktopAppUpdate) {

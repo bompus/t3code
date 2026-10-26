@@ -33,6 +33,7 @@ function machine(
     },
     connected: true,
     hostedByThisApp: false,
+    desktopRelaunched: false,
     canMaintain: true,
     updateState: { status: "idle" },
     ...overrides,
@@ -61,6 +62,7 @@ describe("collectServerUpdateTargets", () => {
         machine("current", "0.0.50", "boot-service"),
         machine("current-offline", "0.0.50", "boot-service", { connected: false }),
         machine("manual", "0.0.40", undefined),
+        machine("ssh-managed", "0.0.40", undefined, { desktopRelaunched: true }),
       ],
       "0.0.50",
     );
@@ -76,6 +78,7 @@ describe("collectServerUpdateTargets", () => {
       ["no-scope", "no permission"],
       ["busy", "already updating"],
       ["manual", "needs a manual update"],
+      ["ssh-managed", "updates when the desktop app reconnects"],
     ]);
   });
 });

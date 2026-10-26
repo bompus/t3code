@@ -37,6 +37,19 @@ vi.mock(import("~/hooks/useSettings"), async (original) => ({
       continueThreadsAfterServerUpdate: testState.continueThreadsAfterServerUpdate,
     })) as never,
 }));
+vi.mock(import("~/state/environments"), async (original) => ({
+  ...(await original()),
+  useEnvironment: ((environmentId: EnvironmentId) => ({
+    environmentId,
+    entry: {
+      target: {
+        _tag: environmentId.startsWith("env-ssh")
+          ? "SshConnectionTarget"
+          : "BearerConnectionTarget",
+      },
+    },
+  })) as never,
+}));
 vi.mock(import("~/state/session"), async (original) => {
   const actual = await original();
   return {
@@ -58,6 +71,7 @@ vi.mock(import("./ui/toast"), async (original) => {
 
 import { resetConfirmDialogForTests } from "~/confirmDialog";
 import { appAtomRegistry } from "~/rpc/atomRegistry";
+import { readStoredSshServerKinds, recordSshServerKind } from "~/state/desktopSshServerKind";
 import {
   ServerUpdateAction,
   ServerUpdatesAction,
@@ -170,6 +184,54 @@ describe("ServerUpdateAction", () => {
       expect(testState.updateServer).toHaveBeenCalledTimes(allowed ? 1 : 0);
     },
   );
+
+  it.each(["button", "icon"] as const)(
+    "tells a server the desktop app launched over SSH that the desktop updates it (%s)",
+    async (appearance) => {
+      using _state = setup();
+      recordSshServerKind("env-ssh-managed" as EnvironmentId, "managed");
+      await using screen = await renderAction({
+        environmentId: "env-ssh-managed" as EnvironmentId,
+        selfUpdate: null,
+        appearance,
+      });
+      expect(button(screen)).toBeUndefined();
+      const notice =
+        appearance === "icon"
+          ? screen.container.querySelector('[tabindex="0"]')?.getAttribute("aria-label")
+          : screen.container.textContent;
+      expect(notice).toContain("The desktop app updates this server when it reconnects.");
+    },
+  );
+
+  it("restores the launch kind after a restart", () => {
+    window.localStorage.setItem(
+      "t3code:ssh-server-kinds:v1",
+      JSON.stringify({ "env-ssh-restored": "managed" }),
+    );
+    expect(readStoredSshServerKinds()).toEqual({ "env-ssh-restored": "managed" });
+    window.localStorage.removeItem("t3code:ssh-server-kinds:v1");
+  });
+
+  it("still offers the relaunch command once the same server is paired by URL", async () => {
+    using _state = setup();
+    recordSshServerKind("env-paired-by-url" as EnvironmentId, "managed");
+    await using screen = await renderAction({
+      environmentId: "env-paired-by-url" as EnvironmentId,
+      selfUpdate: null,
+    });
+    expect(button(screen)).toBeDefined();
+  });
+
+  it("still offers the relaunch command for an SSH server the desktop adopted rather than launched", async () => {
+    using _state = setup();
+    recordSshServerKind("env-ssh-external" as EnvironmentId, "external");
+    await using screen = await renderAction({
+      environmentId: "env-ssh-external" as EnvironmentId,
+      selfUpdate: null,
+    });
+    expect(button(screen)).toBeDefined();
+  });
 
   it("disables the action once maintenance access is removed", async () => {
     using _state = setup();

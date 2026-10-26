@@ -54,6 +54,7 @@ import { isHostedStaticApp } from "../hostedPairing";
 import { isLocalEnvironmentDisabled } from "../localEnvironment";
 import { randomUUID } from "../lib/utils";
 import { appAtomRegistry } from "../rpc/atomRegistry";
+import { recordSshServerKind } from "../state/desktopSshServerKind";
 import { acknowledgeRpcRequest, trackRpcRequestSent } from "../rpc/requestLatencyState";
 import {
   desktopLocalConnectionId,
@@ -252,6 +253,7 @@ export const provisionDesktopSshEnvironment = Effect.fn(
       });
     },
   });
+  recordSshServerKind(descriptor.environmentId, bootstrap.remoteServerKind);
   return {
     environmentId: descriptor.environmentId,
     label: descriptor.label,
@@ -291,6 +293,7 @@ export const prepareDesktopSshEnvironment = Effect.fn("web.connectionPlatform.ss
         try: () => bridge.fetchSshSessionState(bootstrap.httpBaseUrl, bearerToken),
         catch: sshPreparationError,
       });
+      recordSshServerKind(input.expectedEnvironmentId, bootstrap.remoteServerKind);
       // Stored grants never widen; re-pair tokens missing newer standard scopes.
       const granted = session.permissions ?? session.scopes ?? [];
       if (
