@@ -663,6 +663,7 @@ function makeManager(input?: {
   serverSettings?: Parameters<typeof ServerSettings.layerTest>[0];
   setupScriptRunner?: ProjectSetupScriptRunner.ProjectSetupScriptRunner["Service"];
   gitConfigReads?: string[];
+  gitCalls?: string[];
 }) {
   const { service: gitHubCli, ghCalls } = createGitHubCliWithFakeGh(input?.ghScenario);
   const textGeneration = createTextGeneration(input?.textGeneration);
@@ -672,30 +673,40 @@ function makeManager(input?: {
 
   const serverSettingsLayer = ServerSettings.ServerSettingsService.layerTest(input?.serverSettings);
 
-  const vcsDriverLayer = input?.gitConfigReads
-    ? Layer.effect(
-        GitVcsDriver.GitVcsDriver,
-        GitVcsDriver.make.pipe(
-          Effect.map((service) =>
-            GitVcsDriver.GitVcsDriver.of({
-              ...service,
-              readConfigValue: (cwd, key) =>
-                Effect.sync(() => input.gitConfigReads?.push(key)).pipe(
-                  Effect.andThen(service.readConfigValue(cwd, key)),
-                ),
-            }),
+  const vcsDriverLayer =
+    input?.gitConfigReads || input?.gitCalls
+      ? Layer.effect(
+          GitVcsDriver.GitVcsDriver,
+          GitVcsDriver.make.pipe(
+            Effect.map((service) =>
+              GitVcsDriver.GitVcsDriver.of({
+                ...service,
+                execute: (executeInput) =>
+                  Effect.sync(() => input.gitCalls?.push(executeInput.operation)).pipe(
+                    Effect.andThen(service.execute(executeInput)),
+                  ),
+                readConfigValue: (cwd, key) =>
+                  Effect.sync(() => {
+                    input.gitConfigReads?.push(key);
+                    input.gitCalls?.push(`config:${key}`);
+                  }).pipe(Effect.andThen(service.readConfigValue(cwd, key))),
+                resolveDefaultBranchName: (cwd, remoteName) =>
+                  Effect.sync(() => input.gitCalls?.push("resolveDefaultBranchName")).pipe(
+                    Effect.andThen(service.resolveDefaultBranchName(cwd, remoteName)),
+                  ),
+              }),
+            ),
           ),
-        ),
-      ).pipe(
-        Layer.provideMerge(VcsProcess.layer),
-        Layer.provideMerge(NodeServices.layer),
-        Layer.provideMerge(serverConfigLayer),
-      )
-    : GitVcsDriver.layer.pipe(
-        Layer.provideMerge(VcsProcess.layer),
-        Layer.provideMerge(NodeServices.layer),
-        Layer.provideMerge(serverConfigLayer),
-      );
+        ).pipe(
+          Layer.provideMerge(VcsProcess.layer),
+          Layer.provideMerge(NodeServices.layer),
+          Layer.provideMerge(serverConfigLayer),
+        )
+      : GitVcsDriver.layer.pipe(
+          Layer.provideMerge(VcsProcess.layer),
+          Layer.provideMerge(NodeServices.layer),
+          Layer.provideMerge(serverConfigLayer),
+        );
   const sourceControlRegistryLayer = Layer.effect(
     SourceControlProviderRegistry.SourceControlProviderRegistry,
     (input?.sourceControlProvider === undefined
@@ -1515,6 +1526,56 @@ it.layer(GitManagerTestLayer)("GitManager", (it) => {
         repositoryKey: "github.com/pingdotgg/codething-mvp",
       });
       expect(ghCalls.filter((call) => call.startsWith("pr list "))).toHaveLength(2);
+    }),
+  );
+
+  it.effect("branch PR lookup on a warm cache only re-reads the repository identity", () =>
+    Effect.gen(function* () {
+      const repoDir = yield* makeTempDir("t3code-git-manager-");
+      yield* initRepo(repoDir);
+      const remoteDir = yield* createBareRemote();
+      yield* runGit(repoDir, ["remote", "add", "origin", remoteDir]);
+      yield* runGit(repoDir, ["checkout", "-b", "feature/warm-cache-spawns"]);
+      yield* runGit(repoDir, ["push", "-u", "origin", "feature/warm-cache-spawns"]);
+      const gitCalls: string[] = [];
+      const { manager, ghCalls } = yield* makeManager({
+        gitCalls,
+        ghScenario: {
+          prListSequence: [
+            // @effect-diagnostics-next-line preferSchemaOverJson:off
+            JSON.stringify([
+              {
+                number: 998,
+                title: "Warm cache PR",
+                url: "https://github.com/pingdotgg/codething-mvp/pull/998",
+                baseRefName: "main",
+                headRefName: "feature/warm-cache-spawns",
+                state: "OPEN",
+                updatedAt: "2026-04-07T15:00:00Z",
+              },
+            ]),
+          ],
+        },
+      });
+
+      const first = yield* manager.branchPullRequest({
+        cwd: repoDir,
+        branch: "feature/warm-cache-spawns",
+      });
+      expect(first?.number).toBe(998);
+
+      gitCalls.length = 0;
+      const second = yield* manager.branchPullRequest({
+        cwd: repoDir,
+        branch: "feature/warm-cache-spawns",
+      });
+
+      expect(second?.number).toBe(998);
+      expect(ghCalls.filter((call) => call.startsWith("pr list "))).toHaveLength(1);
+      // Key derivation is cached with the lookup; the only live git work left
+      // on a warm hit is the identity re-verification, reading the head
+      // remote's URL once (head and target are both origin here).
+      expect(gitCalls).toEqual(["config:remote.origin.url"]);
     }),
   );
 
