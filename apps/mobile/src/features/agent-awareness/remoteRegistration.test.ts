@@ -540,6 +540,60 @@ describe("makeRelayDeviceRegistrationRequest", () => {
     }).pipe(Effect.provide(layerRelayTest));
   });
 
+  it.effect("retries Android token failures without disabling an accepted registration", () => {
+    vi.spyOn(Platform, "OS", "get").mockReturnValue("android");
+    vi.spyOn(Platform, "Version", "get").mockReturnValue(36);
+    vi.mocked(Notifications.getDevicePushTokenAsync)
+      .mockRejectedValueOnce(new Error("Default FirebaseApp is not initialized"))
+      .mockResolvedValue({ type: "android", data: "fcm-token" });
+    const registrations: unknown[] = [];
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init);
+      if (request.url.endsWith("/v1/client/dpop-token")) {
+        return Response.json({
+          access_token: "dpop",
+          issued_token_type: "urn:ietf:params:oauth:token-type:access_token",
+          token_type: "DPoP",
+          expires_in: 300,
+          scope: "mobile:registration",
+        });
+      }
+      registrations.push(await request.json());
+      return Response.json({ ok: true });
+    });
+    Constants.expoConfig!.extra = { relay: { url: "https://relay.example.test" } };
+    setAgentAwarenessRelayTokenProvider(() => Promise.resolve("clerk"), "user-a");
+
+    return Effect.gen(function* () {
+      yield* runBackgroundOperations();
+      expect(getAgentAwarenessRegistrationStatus()).toBe("failed");
+      expect(registrations).toEqual([]);
+      expect(registrationRecordStore.current).toBeNull();
+
+      setAgentAwarenessRelayTokenProvider(() => Promise.resolve("clerk"), "user-a");
+      yield* runBackgroundOperations();
+      expect(getAgentAwarenessRegistrationStatus()).toBe("registered");
+      expect(registrations).toEqual([
+        expect.objectContaining({
+          pushToken: "fcm-token",
+          preferences: expect.objectContaining({ notificationsEnabled: true }),
+        }),
+      ]);
+      const acceptedRecord = registrationRecordStore.current;
+
+      vi.mocked(Notifications.getDevicePushTokenAsync).mockRejectedValueOnce(
+        new Error("SERVICE_NOT_AVAILABLE"),
+      );
+      yield* refreshAgentAwarenessRegistration();
+      expect(getAgentAwarenessRegistrationStatus()).toBe("registered");
+      expect(registrations).toHaveLength(1);
+      expect(registrationRecordStore.current).toEqual(acceptedRecord);
+    }).pipe(
+      Effect.provideService(FetchHttpClient.Fetch, globalThis.fetch),
+      Effect.provide(layerRelayTest),
+    );
+  });
+
   it.effect("keeps a registered status when a later refresh fails", () => {
     Constants.expoConfig!.extra = {
       relay: {
