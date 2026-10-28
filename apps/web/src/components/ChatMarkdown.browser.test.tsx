@@ -192,6 +192,17 @@ describe("ChatMarkdown streaming", () => {
     }
   });
 
+  it("parses math as math after math rendering is enabled mid-stream", async () => {
+    setup();
+    const message = (text: string) => <ChatMarkdown cwd="/tmp/project" text={text} isStreaming />;
+    await using screen = await render(message("Settled intro paragraph.\n\n"));
+    expect(screen.container.querySelector("[data-markdown-math]")).toBeNull();
+
+    settingsOverrides.mathRenderingEnabled = true;
+    await screen.rerender(message("Settled intro paragraph.\n\nNow $x+1$ arrives"));
+    expect(screen.container.querySelector("[data-markdown-math]")).not.toBeNull();
+  });
+
   it("edits the current task text and marker after reusing a renderer", async () => {
     setup();
     let editedText: string | undefined;

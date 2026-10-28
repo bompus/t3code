@@ -1607,9 +1607,15 @@ function ChatMarkdown({
     localMediaPreview,
     closeLocalMediaPreview,
   } = useChatMarkdownState({ text, inline, ...props });
-  // One plugin instance per component so its prefix cache survives re-renders;
-  // a fresh instance per render would discard the cache on every delta.
-  const [incrementalPlugin] = useState(createIncrementalMarkdownPlugin);
+  // One plugin instance per component and math setting so the prefix cache
+  // survives re-renders but never parses with another setting's extensions.
+  const [incrementalPlugins] = useState(() => ({
+    withMath: createIncrementalMarkdownPlugin(),
+    withoutMath: createIncrementalMarkdownPlugin(),
+  }));
+  const incrementalPlugin = componentState.mathEnabled
+    ? incrementalPlugins.withMath
+    : incrementalPlugins.withoutMath;
   const incrementalParsing = props.isStreaming === true && extraRemarkPlugins.length === 0;
   const Root = inline ? "span" : "div";
   const bindMarkdownRef = (node: HTMLElement | null) => {
