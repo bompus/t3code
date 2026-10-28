@@ -243,6 +243,51 @@ const messageEntriesCache = new WeakMap<
   Extract<RawThreadFeedEntry, { readonly type: "message" }>
 >();
 const activityGroupsCache = new WeakMap<ThreadFeedActivity, ThreadFeedActivityGroup>();
+// Per-activity derivation caches (mirrors web's session-logic): appending one
+// activity replaces the activities array, so the array-keyed cache above
+// cannot reuse the unchanged prefix. Keyed on the immutable activity and
+// derived-entry objects instead.
+const derivedWorkLogEntryByActivity = new WeakMap<
+  OrchestrationThreadActivity,
+  DerivedWorkLogEntry
+>();
+const threadFeedActivityEntryByDerived = new WeakMap<
+  DerivedWorkLogEntry,
+  Extract<RawThreadFeedEntry, { readonly type: "activity" }>
+>();
+// Collapse merges are pure functions of their two input entries; caching by
+// input pair keeps merged rows identical across appends, like unmerged rows.
+const mergedDerivedEntryByPair = new WeakMap<
+  DerivedWorkLogEntry,
+  WeakMap<DerivedWorkLogEntry, DerivedWorkLogEntry>
+>();
+const mergedSpawnEntryByPair = new WeakMap<
+  DerivedWorkLogEntry,
+  WeakMap<DerivedWorkLogEntry, DerivedWorkLogEntry>
+>();
+
+function pairCacheGet(
+  cache: WeakMap<DerivedWorkLogEntry, WeakMap<DerivedWorkLogEntry, DerivedWorkLogEntry>>,
+  previous: DerivedWorkLogEntry,
+  next: DerivedWorkLogEntry,
+): DerivedWorkLogEntry | undefined {
+  return cache.get(previous)?.get(next);
+}
+
+function pairCacheSet(
+  cache: WeakMap<DerivedWorkLogEntry, WeakMap<DerivedWorkLogEntry, DerivedWorkLogEntry>>,
+  previous: DerivedWorkLogEntry,
+  next: DerivedWorkLogEntry,
+  merged: DerivedWorkLogEntry,
+): DerivedWorkLogEntry {
+  let byNext = cache.get(previous);
+  if (!byNext) {
+    byNext = new WeakMap();
+    cache.set(previous, byNext);
+  }
+  byNext.set(next, merged);
+  return merged;
+}
 const presentedActivityGroupsCache = new WeakMap<
   ThreadFeedActivityGroup,
   {
@@ -476,6 +521,10 @@ function isPlanBoundaryToolActivity(activity: OrchestrationThreadActivity): bool
 const decodeQuestionAttachmentAnswer = Schema.decodeUnknownOption(UserInputAttachmentAnswerPayload);
 
 function toDerivedWorkLogEntry(activity: OrchestrationThreadActivity): DerivedWorkLogEntry {
+  const cachedEntry = derivedWorkLogEntryByActivity.get(activity);
+  if (cachedEntry) {
+    return cachedEntry;
+  }
   const payload =
     activity.payload && typeof activity.payload === "object"
       ? (activity.payload as Record<string, unknown>)
@@ -630,6 +679,7 @@ function toDerivedWorkLogEntry(activity: OrchestrationThreadActivity): DerivedWo
   if (collapseKey) {
     entry.collapseKey = collapseKey;
   }
+  derivedWorkLogEntryByActivity.set(activity, entry);
   return entry;
 }
 
@@ -696,21 +746,28 @@ function mergeAgentSpawnEntries(
   existing: DerivedWorkLogEntry,
   entry: DerivedWorkLogEntry,
 ): DerivedWorkLogEntry {
+  const cached = pairCacheGet(mergedSpawnEntryByPair, existing, entry);
+  if (cached) {
+    return cached;
+  }
   const spawn = existing.agentSpawn!;
   const taskId = entry.taskId ?? "";
   const memberIndex = spawn.agentTaskIds.indexOf(taskId);
+  let merged: DerivedWorkLogEntry;
   if (memberIndex === -1) {
-    return agentSpawnRow(
+    merged = agentSpawnRow(
       existing,
       spawn.workflowId,
       [...spawn.agentTaskIds, taskId],
       [...spawn.agents, agentSpawnMember(entry)],
     );
+  } else {
+    const agents = spawn.agents.map((agent, index) =>
+      index === memberIndex ? agentSpawnMember(entry, agent) : agent,
+    );
+    merged = agentSpawnRow(existing, spawn.workflowId, spawn.agentTaskIds, agents);
   }
-  const agents = spawn.agents.map((agent, index) =>
-    index === memberIndex ? agentSpawnMember(entry, agent) : agent,
-  );
-  return agentSpawnRow(existing, spawn.workflowId, spawn.agentTaskIds, agents);
+  return pairCacheSet(mergedSpawnEntryByPair, existing, entry, merged);
 }
 
 function agentSpawnLifecycleStatus(
@@ -867,6 +924,10 @@ function mergeDerivedWorkLogEntries(
   previous: DerivedWorkLogEntry,
   next: DerivedWorkLogEntry,
 ): DerivedWorkLogEntry {
+  const cached = pairCacheGet(mergedDerivedEntryByPair, previous, next);
+  if (cached) {
+    return cached;
+  }
   const changedFiles = mergeChangedFiles(previous.changedFiles, next.changedFiles);
   const detail = next.detail ?? previous.detail;
   const viewedImagePath = next.viewedImagePath ?? previous.viewedImagePath;
@@ -882,7 +943,7 @@ function mergeDerivedWorkLogEntries(
   const toolLifecycleStatus = next.toolLifecycleStatus ?? previous.toolLifecycleStatus;
   const toolCallId = next.toolCallId ?? previous.toolCallId;
   const toolData = next.toolData ?? previous.toolData;
-  return {
+  const merged: DerivedWorkLogEntry = {
     ...previous,
     ...next,
     id: previous.id,
@@ -903,6 +964,7 @@ function mergeDerivedWorkLogEntries(
     ...(toolCallId ? { toolCallId } : {}),
     ...(toolData !== undefined ? { toolData } : {}),
   };
+  return pairCacheSet(mergedDerivedEntryByPair, previous, next, merged);
 }
 
 function mergeChangedFiles(
@@ -2459,6 +2521,10 @@ function getThreadFeedActivityEntries(activities: ReadonlyArray<OrchestrationThr
 function toThreadFeedActivityEntry(
   entry: DerivedWorkLogEntry,
 ): Extract<RawThreadFeedEntry, { readonly type: "activity" }> {
+  const cached = threadFeedActivityEntryByDerived.get(entry);
+  if (cached) {
+    return cached;
+  }
   const summary = workEntryHeading(entry);
   const detail = workEntryPreview(entry);
   const getFullDetail = memoizeValue(() => buildWorkEntryExpandedBody(entry));
@@ -2478,7 +2544,7 @@ function toThreadFeedActivityEntry(
       })
       .join("\n");
   });
-  return {
+  const feedEntry: Extract<RawThreadFeedEntry, { readonly type: "activity" }> = {
     type: "activity",
     id: entry.id,
     createdAt: entry.createdAt,
@@ -2499,4 +2565,6 @@ function toThreadFeedActivityEntry(
       workEntry: entry,
     },
   };
+  threadFeedActivityEntryByDerived.set(entry, feedEntry);
+  return feedEntry;
 }

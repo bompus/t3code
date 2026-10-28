@@ -389,6 +389,117 @@ describe("buildThreadFeed", () => {
     expect(nextRows.some((row) => row.type === "activity-group")).toBe(true);
   });
 
+  it("reuses derived activity entries when a new activity is appended", () => {
+    const turnId = TurnId.make("append-turn");
+    const activities = [1, 2, 3].map((second) =>
+      makeActivity({
+        id: EventId.make(`append-work-${second}`),
+        kind: "tool.completed",
+        summary: `Read file ${second}`,
+        createdAt: `2026-04-01T00:00:0${second}.000Z`,
+        turnId,
+        payload: {
+          itemType: "file_read",
+          status: "completed",
+          detail: `Read apps/mobile/src/lib/file${second}.ts`,
+        },
+      }),
+    );
+    const thread = makeThread({
+      id: ThreadId.make("feed-append-reuse"),
+      projectId: ProjectId.make("project-1"),
+      title: "Feed append reuse",
+      activities,
+    });
+    const byId = (feed: ReturnType<typeof buildThreadFeed>) =>
+      new Map(
+        feed.flatMap((row) =>
+          row.type === "activity-group" ? row.activities.map((a) => [a.id, a] as const) : [],
+        ),
+      );
+    const previous = byId(buildThreadFeed(thread));
+    expect(previous.size).toBe(3);
+
+    const appended = makeActivity({
+      id: EventId.make("append-work-4"),
+      kind: "tool.completed",
+      summary: "Read file 4",
+      createdAt: "2026-04-01T00:00:04.000Z",
+      turnId,
+      payload: {
+        itemType: "file_read",
+        status: "completed",
+        detail: "Read apps/mobile/src/lib/file4.ts",
+      },
+    });
+    const next = byId(buildThreadFeed({ ...thread, activities: [...activities, appended] }));
+
+    expect(next.size).toBe(4);
+    expect(next.get("append-work-4")).toBeDefined();
+    for (const [id, activity] of previous) {
+      expect(next.get(id)).toBe(activity);
+      expect(next.get(id)?.workEntry).toBe(activity.workEntry);
+    }
+  });
+
+  it("reuses merged lifecycle rows when a new activity is appended", () => {
+    const turnId = TurnId.make("merge-turn");
+    const lifecyclePair = (pair: number, firstSecond: number) => [
+      makeActivity({
+        id: EventId.make(`merge-work-${pair}-updated`),
+        kind: "tool.updated",
+        summary: `Run checks ${pair}`,
+        createdAt: `2026-04-01T00:00:0${firstSecond}.000Z`,
+        turnId,
+        payload: {
+          itemType: "command_execution",
+          status: "inProgress",
+          toolCallId: `call-${pair}`,
+          command: `vp test suite-${pair}`,
+        },
+      }),
+      makeActivity({
+        id: EventId.make(`merge-work-${pair}-completed`),
+        kind: "tool.completed",
+        summary: `Run checks ${pair}`,
+        createdAt: `2026-04-01T00:00:0${firstSecond + 1}.000Z`,
+        turnId,
+        payload: {
+          itemType: "command_execution",
+          status: "completed",
+          toolCallId: `call-${pair}`,
+          command: `vp test suite-${pair}`,
+          detail: `output for call ${pair}`,
+        },
+      }),
+    ];
+    const activities = [...lifecyclePair(1, 1), ...lifecyclePair(2, 3)];
+    const thread = makeThread({
+      id: ThreadId.make("feed-merge-reuse"),
+      projectId: ProjectId.make("project-1"),
+      title: "Feed merge reuse",
+      activities,
+    });
+    const byId = (feed: ReturnType<typeof buildThreadFeed>) =>
+      new Map(
+        feed.flatMap((row) =>
+          row.type === "activity-group" ? row.activities.map((a) => [a.id, a] as const) : [],
+        ),
+      );
+    const previous = byId(buildThreadFeed(thread));
+    expect(previous.size).toBe(2);
+
+    const next = byId(
+      buildThreadFeed({ ...thread, activities: [...activities, ...lifecyclePair(3, 5)] }),
+    );
+
+    expect(next.size).toBe(3);
+    for (const [id, activity] of previous) {
+      expect(next.get(id)).toBe(activity);
+      expect(next.get(id)?.workEntry).toBe(activity.workEntry);
+    }
+  });
+
   it("regroups cached activities for message changes and pagination", () => {
     const messages = [2, 4].map((second) => ({
       id: MessageId.make(`message-${second}`),
