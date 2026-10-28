@@ -30,7 +30,35 @@ function shiftPositions(node: Root | RootContent, offset: number, lines: number)
   }
 }
 
-// Cache completed fences followed by blank lines; document-wide definitions require a full parse.
+function isClosedFence(node: RootContent, source: string): boolean {
+  const start = node.position?.start.offset;
+  const end = node.position?.end.offset;
+  if (start === undefined || end === undefined) return false;
+  const value = source.slice(start, end);
+  const opening = /^ {0,3}(`{3,}|~{3,})[^\n]*\n/.exec(value)?.[1];
+  if (!opening) return false;
+  const lastLine = value.slice(value.lastIndexOf("\n") + 1);
+  const closing = new RegExp(`^ {0,3}${opening[0]}{${opening.length},}[ \\t]*$`);
+  return closing.test(lastLine);
+}
+
+// Blocks later text cannot extend past a blank line. Lists and blockquotes
+// stay out: their next item still joins the same node after a blank line.
+function isSettledBlock(node: RootContent, source: string): boolean {
+  switch (node.type) {
+    case "paragraph":
+    case "heading":
+    case "thematicBreak":
+    case "table":
+      return true;
+    case "code":
+      return isClosedFence(node, source);
+    default:
+      return false;
+  }
+}
+
+// Cache settled blocks followed by blank lines; document-wide definitions require a full parse.
 function createIncrementalMarkdownParser(parse: Parser): Parser {
   let cached: ParsedPrefix | undefined;
 
@@ -54,18 +82,12 @@ function createIncrementalMarkdownParser(parse: Parser): Parser {
 
     for (let index = root.children.length - 1; index >= 0; index--) {
       const node = root.children[index];
-      if (node?.type !== "code") continue;
-      const start = node.position?.start.offset;
+      if (!node) continue;
       const end = node.position?.end.offset;
-      if (start === undefined || end === undefined) continue;
+      if (end === undefined) continue;
       if (prefix && end < prefix.offset) break;
-      const value = source.slice(start, end);
-      const opening = /^ {0,3}(`{3,}|~{3,})[^\n]*\n/.exec(value)?.[1];
-      if (!opening) continue;
-      const lastLine = value.slice(value.lastIndexOf("\n") + 1);
-      const closing = new RegExp(`^ {0,3}${opening[0]}{${opening.length},}[ \\t]*$`);
       const separator = /^\n[ \t]*\n/.exec(source.slice(end))?.[0];
-      if (!closing.test(lastLine) || !separator) continue;
+      if (!separator || !isSettledBlock(node, source)) continue;
       const offset = end + separator.length;
       cached = {
         source: source.slice(0, offset),

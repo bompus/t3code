@@ -83,6 +83,40 @@ describe("incremental Markdown parsing", () => {
     }
   });
 
+  it("reuses settled prose blocks while streaming without fences", () => {
+    const source =
+      "First paragraph settles here.\n\nSecond paragraph follows.\n\nThird paragraph is still grow";
+    const incremental = createIncrementalMarkdownPlugin();
+    const parsedSources: string[] = [];
+    expect(render(source, incremental, parsedSources)).toEqual(render(source));
+    parsedSources.length = 0;
+    const next = source + "ing now.";
+    expect(render(next, incremental, parsedSources)).toEqual(render(next));
+    expect(parsedSources).not.toContain(next);
+  });
+
+  it.each([
+    "a\n===\n\nb\n---\n",
+    "- first\n\n  continued\n\n- next\n",
+    "1. one\n\n2. two\n\n3. three\n",
+    "> quoted\n>\n> ```js\n> abc\n> ```\n\nend",
+    "<div>\nhello\n\n</div>\n\nend",
+    "[ref]\n\n[ref]: /later",
+    "a[^x]\n\n[^x]: note",
+    "a | b\n--|--\na | b\n\nnext paragraph\n",
+    "\n\n\tcode\n\nmore",
+    "text <https://example.com> *bold*",
+    "> [!NOTE]\n> alert\n\n- [ ] task",
+    "Title\n\npara\ncontinued line\n\n- item\n- item\n\nlast para\n",
+  ])("preserves the parse tree while streaming settled prose %j", (tail) => {
+    const source = "Intro paragraph.\n\n" + tail;
+    const incremental = createIncrementalMarkdownPlugin();
+    for (let end = 0; end <= source.length; end++) {
+      const text = source.slice(0, end);
+      expect(render(text, incremental), `prefix ${end}`).toEqual(render(text));
+    }
+  });
+
   it.each(["\r\n", "\r"])("preserves partial %j line endings", (newline) => {
     const source = (prefix + "next\n\n```\nlast\n```\n\nend").replaceAll("\n", newline);
     const incremental = createIncrementalMarkdownPlugin();
