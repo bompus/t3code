@@ -91,6 +91,25 @@ it("requires every call of a tool to match everyCall, including later repeats", 
   assert.equal(failed(expect, run([])).length, 1);
 });
 
+it("stops early only after a named everyCall already mismatched", () => {
+  const expect = { everyCall: [{ tool: "Agent", args: { fork_turns: "none" } }] };
+  const run = (forkTurns: Array<string | undefined>): SampleRun => ({
+    calls: forkTurns.map((value, step) => ({
+      step,
+      tool: "Agent",
+      input:
+        value === undefined ? { task_name: "probe" } : { task_name: "probe", fork_turns: value },
+    })),
+    text: "",
+    stopReason: "end_turn",
+  });
+
+  assert.equal(failedEarly(expect, run([])), false);
+  assert.equal(failedEarly(expect, run(["none"])), false);
+  assert.equal(failedEarly(expect, run(["all"])), true);
+  assert.equal(failedEarly(expect, run(["none", "all"])), true);
+});
+
 it("runs code-mode calls without exposing host capabilities, including after await", async () => {
   const catalog = [{ name: "mock", description: "mock" }];
   const result = await executeCodex(
