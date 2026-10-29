@@ -150,6 +150,8 @@ const McpToolUseExpect = Schema.Struct({
   calls: Schema.optional(Schema.Array(McpToolUseCall)),
   /** No call may match any entry. */
   callsMustNot: Schema.optional(Schema.Array(McpToolUseCall)),
+  /** Every call of the named tool must match `args`, and at least one call must exist. */
+  everyCall: Schema.optional(Schema.Array(McpToolUseCall)),
   notCalls: Schema.optional(Schema.Array(Schema.String)),
   /** First calls of these tools happen in this order. */
   order: Schema.optional(Schema.Array(Schema.String)),
@@ -1359,6 +1361,13 @@ export const gradeSample = (expect: McpToolUseCase["expect"], run: SampleRun) =>
   const label = ({ tool, args }: McpToolUseCall) => (args ? `${tool} ${valueText(args)}` : tool);
   for (const call of expect.calls ?? []) add(`calls ${label(call)}`, found(call));
   for (const call of expect.callsMustNot ?? []) add(`callsMustNot ${label(call)}`, !found(call));
+  for (const call of expect.everyCall ?? []) {
+    const named = calls.filter((at) => call.tool.split("|").includes(at.tool));
+    add(
+      `everyCall ${label(call)}`,
+      named.length > 0 && named.every((at) => matches(call.args ?? {}, at.input)),
+    );
+  }
   for (const tool of expect.notCalls ?? []) add(`notCalls ${tool}`, count(tool) === 0);
   if (expect.order !== undefined) {
     const firsts = expect.order.map((tool) => calls.findIndex((call) => call.tool === tool));

@@ -70,6 +70,27 @@ it("accepts any tool listed as an alternative", () => {
   ]);
 });
 
+it("requires every call of a tool to match everyCall, including later repeats", () => {
+  const expect = { everyCall: [{ tool: "Agent", args: { fork_turns: "none" } }] };
+  const run = (forkTurns: Array<string | undefined>): SampleRun => ({
+    calls: forkTurns.map((value, step) => ({
+      step,
+      tool: "Agent",
+      input:
+        value === undefined ? { task_name: "probe" } : { task_name: "probe", fork_turns: value },
+    })),
+    text: "",
+    stopReason: "end_turn",
+  });
+
+  assert.deepEqual(failed(expect, run(["none", "none", "none"])), []);
+  const [mixed] = failed(expect, run(["none", "all"]));
+  assert.ok(mixed?.startsWith("everyCall Agent"));
+  const [omitted] = failed(expect, run(["none", undefined]));
+  assert.ok(omitted?.startsWith("everyCall Agent"));
+  assert.equal(failed(expect, run([])).length, 1);
+});
+
 it("runs code-mode calls without exposing host capabilities, including after await", async () => {
   const catalog = [{ name: "mock", description: "mock" }];
   const result = await executeCodex(
