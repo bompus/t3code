@@ -75,6 +75,15 @@ describe("Codex orchestration context", () => {
     // The ACP terminal fallback is ACP-only; Codex agents never need it.
     NodeAssert.ok(!orchestration.includes("acp-mcp-call"));
   });
+
+  it("starts native children without the parent's conversation", () => {
+    const subagents =
+      buildCodexAdditionalContext({ model: "gpt-6.1-sol" }).t3_code_codex_subagents?.value ?? "";
+
+    NodeAssert.match(subagents, /fork_turns: "none"/);
+    NodeAssert.match(subagents, /spawn_agent/);
+    NodeAssert.match(subagents, /share the workspace/);
+  });
 });
 
 describe("Codex device context", () => {
