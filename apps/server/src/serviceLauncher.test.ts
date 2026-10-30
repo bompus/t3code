@@ -10,6 +10,7 @@ import * as Path from "effect/Path";
 import { vi } from "vite-plus/test";
 
 import {
+  capServiceLog,
   databaseBackupBlocker,
   Launcher,
   main,
@@ -19,6 +20,7 @@ import {
   writeServiceState,
 } from "./serviceLauncher.ts";
 import {
+  BOOT_SERVICE_LOG_ENV,
   compareExactServiceVersions,
   decodeServiceState,
   isExactServiceVersion,
@@ -138,6 +140,7 @@ it.layer(NodeServices.layer)("service state persistence", (it) => {
           PATH: "inherited-path",
           T3CODE_HOME: root,
           T3_BOOT_SERVICE_UNIT: "managed-unit",
+          T3_BOOT_SERVICE_LOG: "/managed/boot-service.log",
           T3_SERVICE_LAUNCHER_CONTEXT: "managed-context",
           T3CODE_PORT: "ambient",
         });
@@ -159,6 +162,8 @@ it.layer(NodeServices.layer)("service state persistence", (it) => {
             "t3code_home=/bad",
             "T3_BOOT_SERVICE_UNIT=bad",
             "t3_boot_service_unit=bad",
+            "T3_BOOT_SERVICE_LOG=/bad.log",
+            "t3_boot_service_log=/bad.log",
             "T3_SERVICE_LAUNCHER_CONTEXT=bad",
             "t3_service_launcher_context=bad",
           ].join("\n"),
@@ -210,6 +215,41 @@ it.layer(NodeServices.layer)("service state persistence", (it) => {
       yield* fs.writeFileString(restartPending, "1.0.0\n");
       yield* run();
       assert.isFalse(yield* fs.exists(restartPending));
+    }),
+  );
+
+  it.effect("a fresh launcher caps the log file its unit names", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-service-launcher-log-" });
+      const statePath = path.join(root, "runtime", "service-state.json");
+      const logPath = path.join(root, "elsewhere", "boot-service.log");
+      yield* fs.makeDirectory(path.dirname(logPath), { recursive: true });
+      yield* writeSparseFile(logPath, 17 * 1024 ** 2);
+      yield* writeFakeRuntime(
+        fs,
+        path,
+        path.join(root, "runtime", "versions", "1.0.0"),
+        "setInterval(() => {}, 1_000);\n",
+      );
+      yield* Effect.promise(() =>
+        writeServiceState(statePath, {
+          protocol: SERVICE_LAUNCHER_PROTOCOL,
+          activeVersion: "1.0.0",
+        }),
+      );
+      const launcher = new Launcher(
+        root,
+        yield* Effect.promise(() => readServiceState(statePath)),
+        { environment: { ...process.env, [BOOT_SERVICE_LOG_ENV]: logPath } },
+      );
+      const running = launcher.run();
+      yield* Effect.promise(() => launcher.stop("SIGTERM"));
+      yield* Effect.promise(() => running);
+
+      assert.strictEqual(Number((yield* fs.stat(logPath)).size), 0);
+      assert.strictEqual(Number((yield* fs.stat(`${logPath}.1`)).size), 17 * 1024 ** 2);
     }),
   );
 
@@ -640,6 +680,44 @@ setInterval(() => {}, 1_000);
       assert.include(blocker ?? "", "Not enough free disk space");
       assert.include(blocker ?? "", "10.5 GB needed, 8.0 GB free");
       assert.include(blocker ?? "", "The server was not stopped");
+    }),
+  );
+});
+
+it.layer(NodeServices.layer)("capServiceLog", (it) => {
+  const withLog = (contents: string | undefined) =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const dir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-service-log-" });
+      const logPath = path.join(dir, "boot-service.log");
+      if (contents !== undefined) yield* fs.writeFileString(logPath, contents);
+      return { fs, logPath };
+    });
+
+  it.effect("keeps one older copy and empties the live file past the limit", () =>
+    Effect.gen(function* () {
+      const { fs, logPath } = yield* withLog("0123456789");
+      yield* fs.writeFileString(`${logPath}.1`, "stale");
+      yield* Effect.promise(() => capServiceLog(logPath, 9));
+      assert.strictEqual(yield* fs.readFileString(`${logPath}.1`), "0123456789");
+      assert.strictEqual(yield* fs.readFileString(logPath), "");
+    }),
+  );
+
+  it.effect("leaves a log at or under the limit alone", () =>
+    Effect.gen(function* () {
+      const { fs, logPath } = yield* withLog("0123456789");
+      yield* Effect.promise(() => capServiceLog(logPath, 10));
+      assert.strictEqual(yield* fs.readFileString(logPath), "0123456789");
+      assert.isFalse(yield* fs.exists(`${logPath}.1`));
+    }),
+  );
+
+  it.effect("ignores a missing log", () =>
+    Effect.gen(function* () {
+      const { logPath } = yield* withLog(undefined);
+      yield* Effect.promise(() => capServiceLog(logPath, 1));
     }),
   );
 });
