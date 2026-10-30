@@ -10,20 +10,25 @@ import {
   TerminalProviderInstanceNotFoundError,
 } from "@t3tools/contracts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
+import * as Clock from "effect/Clock";
 import * as Deferred from "effect/Deferred";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Base64Url from "effect/encoding/Base64Url";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as PlatformError from "effect/PlatformError";
 import * as Path from "effect/Path";
+import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as SynchronizedRef from "effect/SynchronizedRef";
+import * as TestClock from "effect/testing/TestClock";
 import { expect, vi } from "vite-plus/test";
 
 import * as ProcessRunner from "../processRunner.ts";
@@ -442,6 +447,133 @@ it.layer(
     }),
   );
 
+  // Which client owns the shared PTY size is left open by the issue, so this only asserts
+  // that every attached renderer is told the grid the PTY actually has.
+  it.effect("tells every attached stream the shared PTY size when attaches disagree", () =>
+    Effect.gen(function* () {
+      const { manager, ptyAdapter } = yield* createManager();
+      const wideEvents: TerminalAttachStreamEvent[] = [];
+      const narrowEvents: TerminalAttachStreamEvent[] = [];
+      const stopWide = yield* manager.attachStream(openInput({ cols: 130, rows: 15 }), (event) =>
+        Effect.sync(() => {
+          wideEvents.push(event);
+        }),
+      );
+      yield* Effect.addFinalizer(() => Effect.sync(stopWide));
+      const stopNarrow = yield* manager.attachStream(openInput({ cols: 54, rows: 15 }), (event) =>
+        Effect.sync(() => {
+          narrowEvents.push(event);
+        }),
+      );
+      yield* Effect.addFinalizer(() => Effect.sync(stopNarrow));
+
+      const spawned = ptyAdapter.spawnInputs[0]!;
+      const ptySize = ptyAdapter.processes[0]!.resizeCalls.at(-1) ?? {
+        cols: spawned.cols,
+        rows: spawned.rows,
+      };
+      const lastReportedSize = (events: ReadonlyArray<TerminalAttachStreamEvent>) => {
+        for (const event of events.toReversed()) {
+          const source: Record<string, unknown> =
+            event.type === "snapshot" ? event.snapshot : event;
+          if (typeof source.cols === "number" && typeof source.rows === "number") {
+            return { cols: source.cols, rows: source.rows };
+          }
+        }
+        return null;
+      };
+
+      expect({
+        wide: lastReportedSize(wideEvents),
+        narrow: lastReportedSize(narrowEvents),
+      }).toEqual({ wide: ptySize, narrow: ptySize });
+    }),
+  );
+
+  it.effect("gives the PTY back to the remaining viewer when the narrowest one detaches", () =>
+    Effect.gen(function* () {
+      const { manager, ptyAdapter } = yield* createManager();
+      const restored = yield* Deferred.make<void>();
+      const stopWide = yield* manager.attachStream(
+        openInput({ cols: 130, rows: 15 }),
+        (event) =>
+          event.type === "activity" && event.cols === 130 && event.rows === 15
+            ? Deferred.succeed(restored, undefined).pipe(Effect.asVoid)
+            : Effect.void,
+        undefined,
+        "wide",
+      );
+      yield* Effect.addFinalizer(() => Effect.sync(stopWide));
+      const stopNarrow = yield* manager.attachStream(
+        openInput({ cols: 54, rows: 15 }),
+        () => Effect.void,
+        undefined,
+        "narrow",
+      );
+      const process = ptyAdapter.processes[0]!;
+
+      yield* manager.resize(
+        { threadId: "thread-1", terminalId: DEFAULT_TERMINAL_ID, cols: 80, rows: 12 },
+        "narrow",
+      );
+      // A resize from a client with no attached stream cannot override attached viewers.
+      yield* manager.resize({
+        threadId: "thread-1",
+        terminalId: DEFAULT_TERMINAL_ID,
+        cols: 200,
+        rows: 50,
+      });
+      expect(process.resizeCalls.at(-1)).toEqual({ cols: 80, rows: 12 });
+
+      stopNarrow();
+      yield* Deferred.await(restored);
+      expect(process.resizeCalls.at(-1)).toEqual({ cols: 130, rows: 15 });
+    }),
+  );
+
+  // Client retries resend the first attach's size, which a later resize may have replaced.
+  it.effect("keeps a viewer's resized grid when the same viewer attaches again", () =>
+    Effect.gen(function* () {
+      const { manager, ptyAdapter } = yield* createManager();
+      const restored = yield* Deferred.make<void>();
+      const stopWide = yield* manager.attachStream(
+        openInput({ cols: 130, rows: 15 }),
+        (event) =>
+          event.type === "activity" && event.cols === 130 && event.rows === 15
+            ? Deferred.succeed(restored, undefined).pipe(Effect.asVoid)
+            : Effect.void,
+        undefined,
+        "wide",
+      );
+      yield* Effect.addFinalizer(() => Effect.sync(stopWide));
+      const stopFirst = yield* manager.attachStream(
+        openInput({ cols: 54, rows: 15 }),
+        () => Effect.void,
+        undefined,
+        "phone",
+      );
+      const process = ptyAdapter.processes[0]!;
+      yield* manager.resize(
+        { threadId: "thread-1", terminalId: DEFAULT_TERMINAL_ID, cols: 100, rows: 15 },
+        "phone",
+      );
+
+      const stopRetry = yield* manager.attachStream(
+        { ...openInput({ cols: 54, rows: 15 }), resume: true },
+        () => Effect.void,
+        undefined,
+        "phone",
+      );
+      expect(process.resizeCalls.at(-1)).toEqual({ cols: 100, rows: 15 });
+
+      stopRetry();
+      stopFirst();
+      yield* Deferred.await(restored);
+      expect(process.resizeCalls.at(-1)).toEqual({ cols: 130, rows: 15 });
+      expect(ptyAdapter.spawnInputs).toHaveLength(1);
+    }),
+  );
+
   it.effect("resumed attaches after close never respawn until the terminal is reopened", () =>
     Effect.gen(function* () {
       const { manager, ptyAdapter } = yield* createManager();
@@ -629,6 +761,154 @@ it.layer(
     }),
   );
 
+  // Answers process-table queries after `queryDuration`, honoring the caller's
+  // timeout the way ProcessRunner's `timedOutResult` mode does.
+  const slowProcessTable = (
+    platform: "linux" | "win32",
+    queryDuration: Duration.Input,
+    queries: Array<{ start: number; end?: number }>,
+    started: ReadonlyArray<Deferred.Deferred<void>>,
+  ): ProcessRunner.ProcessRunner["Service"] => ({
+    run: (input) =>
+      Effect.gen(function* () {
+        const query: { start: number; end?: number } = { start: yield* Clock.currentTimeMillis };
+        queries.push(query);
+        const deferred = started[queries.length - 1];
+        if (deferred) yield* Deferred.succeed(deferred, undefined);
+        const completed = yield* Effect.sleep(queryDuration).pipe(
+          Effect.timeoutOption(input.timeout ?? "1 hour"),
+        );
+        query.end = yield* Clock.currentTimeMillis;
+        return {
+          stdout: Option.isNone(completed)
+            ? ""
+            : platform === "win32"
+              ? "100|9000|node.exe\n"
+              : "  100  9000 node\n",
+          stderr: "",
+          code: Option.isSome(completed) ? ChildProcessSpawner.ExitCode(0) : null,
+          timedOut: Option.isNone(completed),
+          stdoutTruncated: false,
+          stderrTruncated: false,
+          stdoutInvalidUtf8: false,
+          stderrInvalidUtf8: false,
+        };
+      }),
+  });
+
+  const createFallbackManager = (
+    platform: "linux" | "win32",
+    runner: ProcessRunner.ProcessRunner["Service"],
+  ) =>
+    createManager(5, { subprocessPollIntervalMs: 1_000, processKillGraceMs: 0 }).pipe(
+      Effect.provideService(ProcessRunner.ProcessRunner, runner),
+      Effect.provide(layerWithHostPlatform(platform)),
+    );
+
+  it.effect.each(["linux", "win32"] as const)(
+    "reports activity from a slow but successful %s process-table query",
+    (platform) =>
+      Effect.gen(function* () {
+        const started = yield* Deferred.make<void>();
+        const queries: Array<{ start: number; end?: number }> = [];
+        const { manager, getEvents } = yield* createFallbackManager(
+          platform,
+          slowProcessTable(platform, "5 seconds", queries, [started]),
+        );
+
+        yield* manager.open(openInput());
+        yield* TestClock.adjust("1 second");
+        yield* Deferred.await(started);
+        yield* TestClock.adjust("5 seconds");
+
+        expect(
+          (yield* getEvents).some(
+            (event) =>
+              event.type === "activity" && event.hasRunningSubprocess && event.label === "node",
+          ),
+        ).toBe(true);
+        yield* manager.close({ threadId: "thread-1" });
+      }).pipe(Effect.provide(TestClock.layer())),
+  );
+
+  it.effect("idles at least as long as a slow process-table query took before the next", () =>
+    Effect.gen(function* () {
+      const started = yield* Deferred.make<void>();
+      const queries: Array<{ start: number; end?: number }> = [];
+      const { manager } = yield* createFallbackManager(
+        "linux",
+        slowProcessTable("linux", "5 seconds", queries, [started]),
+      );
+
+      yield* manager.open(openInput());
+      yield* TestClock.adjust("1 second");
+      yield* Deferred.await(started);
+      yield* TestClock.adjust("5 seconds");
+      yield* TestClock.adjust(Duration.millis(19_999));
+
+      expect(queries).toHaveLength(1);
+      yield* TestClock.adjust("1 millis");
+      const [slow, next] = queries;
+      expect(next?.start).toBe(slow!.end! + 20_000);
+      yield* manager.close({ threadId: "thread-1" });
+    }).pipe(Effect.provide(TestClock.layer())),
+  );
+
+  it.effect("ends a hung process-table query and paces the retry", () =>
+    Effect.gen(function* () {
+      const started = yield* Deferred.make<void>();
+      const queries: Array<{ start: number; end?: number }> = [];
+      const { manager } = yield* createFallbackManager(
+        "win32",
+        slowProcessTable("win32", "1 day", queries, [started]),
+      );
+
+      yield* manager.open(openInput());
+      yield* TestClock.adjust("1 second");
+      yield* Deferred.await(started);
+      yield* TestClock.adjust("2 minutes");
+      yield* TestClock.adjust("2 minutes");
+
+      const [hung, next] = queries;
+      expect(hung!.end! - hung!.start).toBe(15_000);
+      expect(next!.start - hung!.end!).toBe(60_000);
+      yield* manager.close({ threadId: "thread-1" });
+    }).pipe(Effect.provide(TestClock.layer())),
+  );
+
+  it.effect.each([
+    ["linux", 1_000],
+    ["win32", 1_500],
+  ] as const)(
+    "bounds closeIdle's %s query so other operations on the thread still run",
+    ([platform, budgetMs]) =>
+      Effect.gen(function* () {
+        const started = yield* Deferred.make<void>();
+        const queries: Array<{ start: number; end?: number }> = [];
+        const { manager, ptyAdapter } = yield* createFallbackManager(
+          platform,
+          slowProcessTable(platform, "1 day", queries, [started]),
+        );
+        yield* manager.open(openInput());
+
+        const closing = yield* manager
+          .closeIdle({ threadId: "thread-1" })
+          .pipe(Effect.forkChild({ startImmediately: true }));
+        yield* Deferred.await(started);
+        const resizing = yield* manager
+          .resize({ threadId: "thread-1", terminalId: DEFAULT_TERMINAL_ID, cols: 80, rows: 30 })
+          .pipe(Effect.forkChild({ startImmediately: true }));
+        yield* TestClock.adjust(Duration.millis(budgetMs));
+
+        expect(closing.pollUnsafe()).toBeDefined();
+        expect(resizing.pollUnsafe()).toBeDefined();
+        expect(queries[0]!.end! - queries[0]!.start).toBe(budgetMs);
+        expect(ptyAdapter.processes[0]!.resizeCalls).toEqual([{ cols: 80, rows: 30 }]);
+        expect(ptyAdapter.processes[0]!.killed).toBe(false);
+        yield* manager.close({ threadId: "thread-1" });
+      }).pipe(Effect.provide(TestClock.layer())),
+  );
+
   it.effect("keeps terminals that get input or output while closeIdle checks them", () =>
     Effect.gen(function* () {
       const ptyAdapter = new FakePtyAdapter();
@@ -751,6 +1031,35 @@ it.layer(
       expect(reopened.history.startsWith('prompt \u001b[!p\u001b["p\u001b[4 q\u001b[udone\n')).toBe(
         true,
       );
+    }),
+  );
+
+  it.effect.each([
+    { name: "OSC", sequence: "\u001b]0;unfinished" },
+    { name: "DCS", sequence: "\u001bPunfinished" },
+    { name: "PM", sequence: "\u001b^unfinished" },
+    { name: "APC", sequence: "\u001b_unfinished" },
+    { name: "CSI", sequence: "\u001b[5" },
+    { name: "C1 OSC", sequence: "\u009d0;unfinished" },
+    { name: "C1 DCS", sequence: "\u0090unfinished" },
+    { name: "C1 PM", sequence: "\u009eunfinished" },
+    { name: "C1 APC", sequence: "\u009funfinished" },
+    { name: "C1 CSI", sequence: "\u009b5" },
+  ])("keeps output after a cancelled $name sequence in history", ({ sequence }) =>
+    Effect.gen(function* () {
+      const { manager, ptyAdapter } = yield* createManager();
+      yield* manager.open(openInput());
+      const process = ptyAdapter.processes[0]!;
+      for (const cancel of ["\u0018", "\u001a"]) {
+        process.emitData(sequence);
+        process.emitData(cancel);
+        process.emitData("next line\n");
+        process.emitData(`${sequence}${cancel}next line\n`);
+      }
+      yield* manager.close({ threadId: "thread-1" });
+
+      const reopened = yield* manager.open(openInput());
+      expect(reopened.history.match(/next line/g)).toHaveLength(4);
     }),
   );
 
@@ -1464,6 +1773,53 @@ it.layer(
       ptyAdapter.processes.at(-1)!.emitData("new session only\n");
       expect(yield* pull).toMatchObject([{ type: "output", data: "new session only\n" }]);
       expect(ptyAdapter.spawnInputs).toHaveLength(4);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect.each([
+    { recovered: true, label: "after recovery" },
+    { recovered: false, label: "when cancelled before recovery" },
+  ])("keeps a stalled viewer's size until its attach stream ends ($label)", ({ recovered }) =>
+    Effect.gen(function* () {
+      const { manager, ptyAdapter } = yield* createManager();
+      const restored = yield* Deferred.make<void>();
+      const stopWide = yield* manager.attachStream(
+        openInput({ cols: 130, rows: 15 }),
+        (event) =>
+          event.type === "activity" && event.cols === 130 && event.rows === 15
+            ? Deferred.succeed(restored, undefined).pipe(Effect.asVoid)
+            : Effect.void,
+        undefined,
+        "wide",
+      );
+      yield* Effect.addFinalizer(() => Effect.sync(stopWide));
+      const process = ptyAdapter.processes[0]!;
+
+      yield* Effect.gen(function* () {
+        const pull = yield* Stream.toPull(
+          manager.attachOutputStream(openInput({ cols: 54, rows: 15 }), "narrow"),
+        );
+        expect(yield* pull).toMatchObject([{ type: "snapshot" }]);
+        expect(process.resizeCalls.at(-1)).toEqual({ cols: 54, rows: 15 });
+        // Overflow releases the inner subscription before any recovery pull.
+        yield* publishPastOutputBudget(manager, process);
+        yield* manager.resize(
+          { threadId: "thread-1", terminalId: DEFAULT_TERMINAL_ID, cols: 50, rows: 12 },
+          "narrow",
+        );
+        expect(process.resizeCalls.at(-1)).toEqual({ cols: 50, rows: 12 });
+        if (!recovered) return;
+
+        expect(yield* pull).toMatchObject([{ type: "snapshot" }]);
+        yield* manager.resize(
+          { threadId: "thread-1", terminalId: DEFAULT_TERMINAL_ID, cols: 48, rows: 12 },
+          "narrow",
+        );
+        expect(process.resizeCalls.at(-1)).toEqual({ cols: 48, rows: 12 });
+      }).pipe(Effect.scoped);
+
+      yield* Deferred.await(restored);
+      expect(process.resizeCalls.at(-1)).toEqual({ cols: 130, rows: 15 });
     }).pipe(Effect.scoped),
   );
 
