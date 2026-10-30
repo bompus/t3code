@@ -122,16 +122,19 @@ describe("incremental Markdown parsing", () => {
     }
   });
 
-  it("keeps display math that is still unfinished out of the cache", () => {
-    const source = "Intro paragraph.\n\n$$\nx\n\ny\n$$\n\nend";
-    const incremental = createIncrementalMarkdownPlugin();
-    for (let end = 0; end <= source.length; end++) {
-      const text = source.slice(0, end);
-      expect(render(text, incremental, undefined, true), `prefix ${end}`).toEqual(
-        render(text, undefined, undefined, true),
-      );
-    }
-  });
+  it.each(["$$\nx\n\ny\n$$", "\\[\nx\n\ny\n\\]"])(
+    "keeps display math that is still unfinished out of the cache: %j",
+    (math) => {
+      const source = `Intro paragraph.\n\n${math}\n\nend`;
+      const incremental = createIncrementalMarkdownPlugin();
+      for (let end = 0; end <= source.length; end++) {
+        const text = source.slice(0, end);
+        expect(render(text, incremental, undefined, true), `prefix ${end}`).toEqual(
+          render(text, undefined, undefined, true),
+        );
+      }
+    },
+  );
 
   it.each(["\r\n", "\r"])("preserves partial %j line endings", (newline) => {
     const source = (prefix + "next\n\n```\nlast\n```\n\nend").replaceAll("\n", newline);
