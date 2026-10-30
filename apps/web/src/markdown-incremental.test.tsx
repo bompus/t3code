@@ -3,7 +3,8 @@ import type { Root } from "mdast";
 import { renderToStaticMarkup } from "react-dom/server";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import type { Plugin } from "unified";
+import remarkMath from "remark-math";
+import type { Plugin, PluggableList } from "unified";
 import { describe, expect, it } from "vite-plus/test";
 
 import { remarkCodexDirectives } from "@t3tools/shared/codexMarkdownDirectives";
@@ -11,7 +12,12 @@ import { remarkGithubAlerts } from "@t3tools/shared/markdownGithubAlerts";
 import { createIncrementalMarkdownPlugin } from "./markdown-incremental";
 import { remarkNormalizeListItemIndentation } from "@t3tools/shared/markdownListIndentation";
 
-function render(source: string, incremental?: Plugin<[], Root>, parsedSources?: string[]) {
+function render(
+  source: string,
+  incremental?: Plugin<[], Root>,
+  parsedSources?: string[],
+  math = false,
+) {
   let tree: Root | undefined;
   const observeParsing: Plugin<[], Root> = function () {
     const original = this.parser;
@@ -25,19 +31,18 @@ function render(source: string, incremental?: Plugin<[], Root>, parsedSources?: 
   const capture: Plugin<[], Root> = () => (root) => {
     tree = structuredClone(root);
   };
+  const remarkPlugins: PluggableList = [
+    observeParsing,
+    capture,
+    remarkGfm,
+    remarkGithubAlerts,
+    remarkNormalizeListItemIndentation,
+    remarkCodexDirectives,
+  ];
+  if (math) remarkPlugins.unshift([remarkMath, { singleDollarTextMath: true }]);
+  if (incremental) remarkPlugins.push(incremental);
   const html = renderToStaticMarkup(
-    <ReactMarkdown
-      remarkPlugins={[
-        observeParsing,
-        capture,
-        remarkGfm,
-        remarkGithubAlerts,
-        remarkNormalizeListItemIndentation,
-        remarkCodexDirectives,
-        ...(incremental ? [incremental] : []),
-      ]}
-      rehypePlugins={CHAT_MARKDOWN_REHYPE_PLUGINS}
-    >
+    <ReactMarkdown remarkPlugins={remarkPlugins} rehypePlugins={CHAT_MARKDOWN_REHYPE_PLUGINS}>
       {source}
     </ReactMarkdown>,
   );
@@ -114,6 +119,17 @@ describe("incremental Markdown parsing", () => {
     for (let end = 0; end <= source.length; end++) {
       const text = source.slice(0, end);
       expect(render(text, incremental), `prefix ${end}`).toEqual(render(text));
+    }
+  });
+
+  it("keeps display math that is still unfinished out of the cache", () => {
+    const source = "Intro paragraph.\n\n$$\nx\n\ny\n$$\n\nend";
+    const incremental = createIncrementalMarkdownPlugin();
+    for (let end = 0; end <= source.length; end++) {
+      const text = source.slice(0, end);
+      expect(render(text, incremental, undefined, true), `prefix ${end}`).toEqual(
+        render(text, undefined, undefined, true),
+      );
     }
   });
 

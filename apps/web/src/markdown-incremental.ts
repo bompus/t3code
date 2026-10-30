@@ -65,6 +65,8 @@ function createIncrementalMarkdownParser(parse: Parser): Parser {
   return (source, file) => {
     // Streaming CR may become CRLF; parsing a suffix separately would strip an internal BOM.
     if (source.includes("\r") || source.includes("\uFEFF")) return parse(source, file);
+    // Display math that is still open parses as plain paragraphs, so settling them would cut the formula.
+    if (source.includes("$$")) return parse(source, file);
 
     const prefix = cached && source.startsWith(cached.source) ? cached : undefined;
     let root: Root;
