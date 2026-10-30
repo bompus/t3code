@@ -23,6 +23,8 @@ import { type ComponentProps, useRef, useState } from "react";
 
 import { requestConfirmDialog } from "~/confirmDialog";
 import { useCopyToClipboard } from "~/hooks/useCopyToClipboard";
+import { useDesktopRelaunchesServer } from "~/state/desktopSshServerKind";
+import { useEnvironment } from "~/state/environments";
 import { serverEnvironment, updateOutdatedServer } from "~/state/server";
 import { appAtomRegistry } from "~/rpc/atomRegistry";
 import { useAtomCommand } from "~/state/use-atom-command";
@@ -39,6 +41,8 @@ const UPDATE_STAGE_LABELS: Record<ServerUpdateStage, string> = {
   resuming: "Restarting…",
 };
 const pendingUpdateEnvironmentIds = new Set<EnvironmentId>();
+
+export const DESKTOP_RELAUNCH_NOTICE = "The desktop app updates this server when it reconnects.";
 
 export function serverUpdateStageLabel(stage: ServerUpdateStage): string {
   return UPDATE_STAGE_LABELS[stage];
@@ -250,6 +254,10 @@ export function ServerUpdateAction({
   const sessionStateAtom = environmentSession.sessionStateAtom(environmentId);
   const canUpdate = canUpdateServer(useAtomValue(sessionStateAtom));
   const update = useServerUpdate();
+  const environment = useEnvironment(environmentId);
+  const desktopRelaunchesServer = useDesktopRelaunchesServer();
+  const desktopRelaunched =
+    selfUpdate === null && environment !== null && desktopRelaunchesServer(environment);
   const { copyToClipboard } = useCopyToClipboard<{ command: string }>({
     target: installation?.kind === "npm-global" ? "update command" : "relaunch command",
     onCopy: ({ command }) => {
@@ -308,6 +316,28 @@ export function ServerUpdateAction({
 
   if (refusedCrossing({ selfUpdate, targetVersion, channel }, serverVersion)) {
     return <CrossTrackNote />;
+  }
+
+  if (desktopRelaunched) {
+    return appearance === "icon" ? (
+      <Tooltip>
+        <TooltipTrigger
+          render={
+            <span
+              tabIndex={0}
+              role="img"
+              aria-label={`${DESKTOP_RELAUNCH_NOTICE} (${serverLabel})`}
+              className="inline-flex size-6 items-center justify-center text-muted-foreground"
+            />
+          }
+        >
+          <CircleArrowUpIcon className="size-3.5" />
+        </TooltipTrigger>
+        <TooltipPopup side="top">{DESKTOP_RELAUNCH_NOTICE}</TooltipPopup>
+      </Tooltip>
+    ) : (
+      <span className="text-muted-foreground text-xs">{DESKTOP_RELAUNCH_NOTICE}</span>
+    );
   }
 
   const manualCommand =
