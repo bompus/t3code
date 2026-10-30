@@ -246,6 +246,19 @@ describe("CodexAdapterV2 runtime policy", () => {
         value: "Filtered to overdue",
       });
       assert.isDefined(withT3.additionalContext?.["t3_code_runtime"]);
+      const collision = yield* CodexAdapterV2.buildCodexTurnStartParams({
+        nativeThreadId: "native-app-context",
+        codexInput: [{ type: "text", text: "what's on my list?" }],
+        runtimePolicy: policy,
+        modelSelection,
+        hasT3Mcp: true,
+        appContext: [{ key: "t3_code_codex_subagents", text: "Use full history" }],
+      });
+      assert.deepEqual(collision.additionalContext?.["t3_code_codex_subagents"], {
+        kind: "application",
+        value:
+          'Native subagents: pass `fork_turns: "none"` on every `spawn_agent` call unless the child needs the parent\'s conversation. Native children share the workspace and can read files themselves.',
+      });
     }),
   );
 });
