@@ -105,8 +105,11 @@ describe("terminal output window", () => {
   it.effect.each(bigChunkEvents)("charges $name against the pending-byte limit", ({ event }) =>
     Effect.gen(function* () {
       const tag = WS_METHODS.terminalAttach;
-      const group = RpcGroup.make(Rpc.make(tag, { success: TerminalEventSchema, stream: true }));
-      const output = yield* Queue.unbounded<Schema.Schema.Type<typeof TerminalEventSchema>>();
+      const group = RpcGroup.make(
+        Rpc.make(tag, { success: TerminalAttachStreamEventSchema, stream: true }),
+      );
+      const output =
+        yield* Queue.unbounded<Schema.Schema.Type<typeof TerminalAttachStreamEventSchema>>();
       const responses = yield* Queue.unbounded<RpcMessage.FromServerEncoded>();
       const receive = yield* Deferred.make<Parameters<RpcServer.Protocol["Service"]["run"]>[0]>();
       const protocol = yield* RpcServer.Protocol.make((write) =>
