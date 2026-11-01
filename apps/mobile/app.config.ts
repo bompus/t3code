@@ -406,6 +406,9 @@ const config: ExpoConfig = {
       {
         android: {
           minSdkVersion: 24,
+          // React Native stores the Hermes bundle uncompressed so it can be memory-mapped.
+          // Compressing it makes the APK on the device, and the universal APK, about 11.6 MB smaller.
+          enableBundleCompression: true,
           // SDK 58 lacks Kotlin 2.3's runtime-inert annotation. R8 needs explicit InputMerger constructors for widgets.
           extraProguardRules: [
             "-dontwarn kotlin.MustUseReturnValues",
