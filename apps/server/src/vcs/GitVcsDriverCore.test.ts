@@ -314,22 +314,24 @@ it.effect.each(["root", "nested", "worktree"] as const)(
     }).pipe(Effect.provide(layerTest)),
 );
 
-it.effect("invalidates origin remote cache when a driver mutation adds origin", () =>
-  Effect.gen(function* () {
-    const driver = yield* GitVcsDriver.GitVcsDriver;
-    const cwd = yield* makeTmpDir();
-    const remote = yield* makeTmpDir("git-vcs-driver-remote-");
-    yield* initRepoWithCommit(cwd);
-    yield* git(remote, ["init", "--bare"]);
+it.effect.each(["origin", "github"] as const)(
+  "recognizes %s as the primary remote after a driver mutation",
+  (remoteName) =>
+    Effect.gen(function* () {
+      const driver = yield* GitVcsDriver.GitVcsDriver;
+      const cwd = yield* makeTmpDir();
+      const remote = yield* makeTmpDir("git-vcs-driver-remote-");
+      yield* initRepoWithCommit(cwd);
+      yield* git(remote, ["init", "--bare"]);
 
-    const before = yield* driver.statusDetailsLocal(cwd);
-    assert.equal(before.hasOriginRemote, false);
+      assert.equal((yield* driver.statusDetailsLocal(cwd)).hasOriginRemote, false);
+      assert.equal((yield* driver.listRefs({ cwd })).hasPrimaryRemote, false);
 
-    yield* driver.ensureRemote({ cwd, preferredName: "origin", url: remote });
+      yield* driver.ensureRemote({ cwd, preferredName: remoteName, url: remote });
 
-    const after = yield* driver.statusDetailsLocal(cwd);
-    assert.equal(after.hasOriginRemote, true);
-  }).pipe(Effect.provide(layerTest)),
+      assert.equal((yield* driver.statusDetailsLocal(cwd)).hasOriginRemote, true);
+      assert.equal((yield* driver.listRefs({ cwd })).hasPrimaryRemote, true);
+    }).pipe(Effect.provide(layerTest)),
 );
 
 it.effect.each([
@@ -5084,6 +5086,31 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
         const status = yield* git(cwd, ["status", "--porcelain"]);
         assert.include(status, "?? b.txt");
         assert.notInclude(status, "a.txt");
+      }),
+    );
+
+    it.effect("stops a selected-file commit when another process holds the index lock", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        yield* initRepoWithCommit(cwd);
+        const head = yield* git(cwd, ["rev-parse", "HEAD"]);
+        yield* writeTextFile(cwd, "a.txt", "a\n");
+        yield* writeTextFile(cwd, "staged.txt", "staged\n");
+        yield* git(cwd, ["add", "staged.txt"]);
+        const lockPath = (yield* Path.Path).join(cwd, ".git", "index.lock");
+        yield* (yield* FileSystem.FileSystem).writeFileString(lockPath, "");
+        const { driver } = yield* makeDriverReleasingLock(
+          (args) => args.includes("reset"),
+          lockPath,
+        );
+
+        const error = yield* driver
+          .commit(cwd, "Add a", "", { stage: { filePaths: ["a.txt"] } })
+          .pipe(Effect.flip);
+
+        assert.equal(error.operation, "GitVcsDriver.commit.reset");
+        assert.equal(yield* git(cwd, ["rev-parse", "HEAD"]), head);
+        assert.equal(yield* git(cwd, ["diff", "--cached", "--name-only"]), "staged.txt");
       }),
     );
 
