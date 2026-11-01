@@ -1933,6 +1933,16 @@ const getNativeThreadId = Effect.fnUntraced(function* (
 
 const isSyntheticClaudeTurnId = (nativeTurnId: string): boolean => nativeTurnId.startsWith("turn:");
 
+const claudeTurnCursor = (turn: OrchestrationV2ProviderTurn): string | null => {
+  const ref = turn.nativeTurnRef;
+  return ref !== null &&
+    ref.driver === CLAUDE_PROVIDER &&
+    ref.nativeId !== null &&
+    !isSyntheticClaudeTurnId(ref.nativeId)
+    ? ref.nativeId
+    : null;
+};
+
 const isTerminalProviderTurn = (turn: OrchestrationV2ProviderTurn): boolean =>
   turn.status === "completed" ||
   turn.status === "interrupted" ||
@@ -2019,14 +2029,9 @@ const resolveClaudeRollbackResumeSessionAt = Effect.fn(
         });
       }
 
-      const nativeTurnRef = target.providerTurn.nativeTurnRef;
-      if (
-        nativeTurnRef !== null &&
-        nativeTurnRef.driver === CLAUDE_PROVIDER &&
-        nativeTurnRef.nativeId !== null &&
-        !isSyntheticClaudeTurnId(nativeTurnRef.nativeId)
-      ) {
-        return nativeTurnRef.nativeId;
+      const cursor = claudeTurnCursor(target.providerTurn);
+      if (cursor !== null) {
+        return cursor;
       }
 
       const providerTurnsAfterTarget = input.providerThreadTurns.filter(
@@ -2034,6 +2039,18 @@ const resolveClaudeRollbackResumeSessionAt = Effect.fn(
       );
       if (providerTurnsAfterTarget.length === 0) {
         return null;
+      }
+
+      // Only compaction can be omitted without dropping a retained user prompt.
+      if (target.message !== undefined && isCompactionCommandMessage(target.message)) {
+        const earlierTurn = input.providerThreadTurns
+          .filter((turn) => turn.ordinal < target.providerTurn.ordinal)
+          .toSorted((left, right) => left.ordinal - right.ordinal)
+          .at(-1);
+        const earlierCursor = earlierTurn === undefined ? null : claudeTurnCursor(earlierTurn);
+        if (earlierCursor != null) {
+          return earlierCursor;
+        }
       }
 
       return yield* new ProviderAdapter.ProviderAdapterRollbackThreadError({
@@ -7258,6 +7275,40 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           return { node, request, turnItem };
         });
 
+        // Claude withdraws a permission request it no longer needs, for example
+        // when a PermissionRequest hook answered it. Close the request and its
+        // card, which would otherwise wait for an answer nothing reads.
+        const cancelWithdrawnRequest = Effect.fnUntraced(function* (
+          artifacts: Effect.Success<ReturnType<typeof buildApprovalRequestArtifacts>>,
+        ) {
+          const now = yield* DateTime.now;
+          yield* Effect.all(
+            [
+              emitProviderEvent({
+                type: "runtime_request.updated",
+                driver: CLAUDE_PROVIDER,
+                runtimeRequest: { ...artifacts.request, status: "cancelled", resolvedAt: now },
+              }),
+              emitProviderEvent({
+                type: "node.updated",
+                driver: CLAUDE_PROVIDER,
+                node: { ...artifacts.node, status: "cancelled", completedAt: now },
+              }),
+              emitProviderEvent({
+                type: "turn_item.updated",
+                driver: CLAUDE_PROVIDER,
+                turnItem: {
+                  ...artifacts.turnItem,
+                  status: "cancelled",
+                  completedAt: now,
+                  updatedAt: now,
+                },
+              }),
+            ],
+            { concurrency: 1 },
+          );
+        });
+
         const ensureReasoningBlock = Effect.fnUntraced(function* (
           context: ActiveClaudeTurnContext,
           itemId: string,
@@ -9735,6 +9786,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                 }),
               ),
             );
+            if (!(yield* Deferred.isDone(answers))) yield* cancelWithdrawnRequest(artifacts);
             return callbackOptions.signal.aborted
               ? ({
                   behavior: "deny",
@@ -9875,6 +9927,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               }),
             ),
           );
+          if (!(yield* Deferred.isDone(decision))) yield* cancelWithdrawnRequest(artifacts);
 
           return permissionResultFromDecision({
             toolName,

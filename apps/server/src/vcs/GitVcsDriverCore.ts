@@ -2232,6 +2232,7 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
     let aheadOfDefaultCount = 0;
     let hasWorkingTreeChanges = false;
     const changedFilesWithoutNumstat = new Set<string>();
+    const untrackedRoots: string[] = [];
 
     const statusRecords = statusStdout.split("\0");
     for (let index = 0; index < statusRecords.length; index++) {
@@ -2256,7 +2257,10 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       if (line.length > 0 && !line.startsWith("#")) {
         hasWorkingTreeChanges = true;
         const pathValue = parsePorcelainPath(line);
-        if (pathValue) changedFilesWithoutNumstat.add(pathValue);
+        if (pathValue) {
+          changedFilesWithoutNumstat.add(pathValue);
+          if (line.startsWith("? ")) untrackedRoots.push(pathValue);
+        }
         // A rename record is followed by its original path as a separate record. Listing it
         // keeps the deletion selectable when committing only some files.
         if (line.startsWith("2 ")) {
@@ -2282,6 +2286,7 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
         options?.includeBranchChanges
           ? readBranchChangeTotals(repositoryPaths?.worktreeRoot ?? cwd, refName, {
               knownOriginDefaultBranch: defaultBranch,
+              untrackedRoots,
             }).pipe(Effect.orElseSucceed(() => undefined))
           : Effect.undefined,
       ],
@@ -3133,7 +3138,10 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
   const readBranchChangeTotals = Effect.fn("readBranchChangeTotals")(function* (
     cwd: string,
     branch: string | null,
-    options?: { readonly knownOriginDefaultBranch: string | null },
+    options?: {
+      readonly knownOriginDefaultBranch: string | null;
+      readonly untrackedRoots: ReadonlyArray<string>;
+    },
   ) {
     const { baseRef, mergeBase } = yield* resolveReviewMergeBase(
       cwd,
@@ -3141,7 +3149,14 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       undefined,
       options?.knownOriginDefaultBranch ?? null,
     );
-    const untracked = yield* prepareUntrackedReviewIndex(cwd, []);
+    const roots = options?.untrackedRoots ?? [];
+    // Bound pathspec matching work and stay below Windows' command-line limit.
+    const pathspecs =
+      roots.length <= 128 && roots.reduce((length, root) => length + root.length + 16, 0) < 8_000
+        ? roots.map((root) => `:(top,literal)${root}`)
+        : [];
+    // Empty status can mean untracked files are hidden; retain the full scan.
+    const untracked = yield* prepareUntrackedReviewIndex(cwd, pathspecs);
     if (untracked === null) {
       return yield* new GitCommandError({
         operation: "GitVcsDriver.readBranchChangeTotals",
@@ -4147,7 +4162,17 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
     const progress = options?.progress;
     const onCheckoutProgress = progress?.onCheckoutProgress;
 
-    const checkoutWorkers = (yield* readConfigValue(input.cwd, "checkout.workers")) ?? "0";
+    // Both reads leave the repository alone, so they share one round trip before the checkout.
+    const [configuredCheckoutWorkers, base] = yield* Effect.all(
+      [
+        readConfigValue(input.cwd, "checkout.workers"),
+        input.newRefName && input.baseRefName
+          ? resolveBranchBase(input.cwd, input.baseRefName)
+          : Effect.succeed(null),
+      ],
+      { concurrency: "unbounded" },
+    );
+    const checkoutWorkers = configuredCheckoutWorkers ?? "0";
     yield* executeGitWithStableDiagnostics(
       "GitVcsDriver.createWorktree",
       input.cwd,
@@ -4224,17 +4249,21 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
             submoduleMode.value === "recursive"
               ? ["submodule", "update", "--init", "--recursive"]
               : ["submodule", "update", "--init"],
-            onSubmoduleLine
-              ? {
-                  env: { LC_ALL: "C" },
-                  progress: { onStdoutLine: onSubmoduleLine, onStderrLine: onSubmoduleLine },
-                }
-              : {},
+            {
+              // Cloning scales with remote size; let it finish or be cancelled, like worktree add.
+              timeoutMs: null,
+              ...(onSubmoduleLine
+                ? {
+                    env: { LC_ALL: "C" },
+                    progress: { onStdoutLine: onSubmoduleLine, onStderrLine: onSubmoduleLine },
+                  }
+                : {}),
+            },
           ),
         ),
         Effect.matchEffect({
           onFailure: (cause) =>
-            Effect.logWarning("worktree submodule checkout failed; submodule paths are empty", {
+            Effect.logWarning("worktree submodule checkout failed; submodules may be incomplete", {
               worktreePath,
               cause,
             }).pipe(
@@ -4253,32 +4282,27 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
     }
 
     const newRefName = input.newRefName;
-    if (newRefName && input.baseRefName) {
-      const base = yield* resolveBranchBase(input.cwd, input.baseRefName);
-      if (base) {
-        yield* Effect.gen(function* () {
+    if (newRefName && base) {
+      yield* Effect.gen(function* () {
+        yield* writeConfigValue({
+          cwd: input.cwd,
+          key: branchBaseConfigKey(newRefName),
+          value: base.branchName,
+        });
+        if (base.baseRef.startsWith("refs/remotes/")) {
+          // The base key names a branch on the host; this one keeps the remote it came from.
           yield* writeConfigValue({
             cwd: input.cwd,
-            key: branchBaseConfigKey(newRefName),
-            value: base.branchName,
+            key: `branch.${newRefName}.t3-merge-base-ref`,
+            value: base.baseRef,
           });
-          if (base.baseRef.startsWith("refs/remotes/")) {
-            // The base key names a branch on the host; this one keeps the remote it came from.
-            yield* writeConfigValue({
-              cwd: input.cwd,
-              key: `branch.${input.newRefName}.t3-merge-base-ref`,
-              value: base.baseRef,
-            });
-          }
-        }).pipe(
-          Effect.catchTags({
-            GitCommandError: () =>
-              Effect.logWarning(
-                "worktree base-ref configuration failed; using base-branch fallback",
-              ),
-          }),
-        );
-      }
+        }
+      }).pipe(
+        Effect.catchTags({
+          GitCommandError: () =>
+            Effect.logWarning("worktree base-ref configuration failed; using base-branch fallback"),
+        }),
+      );
     }
 
     return {
@@ -4444,7 +4468,11 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
     const branch =
       parseRemoteRefWithRemoteNames(input.refName, [input.remoteName])?.branchName ?? input.refName;
     const scopedArgs = [
-      ...args,
+      "fetch",
+      "--quiet",
+      "--no-tags",
+      "--",
+      input.remoteName,
       `+refs/heads/${branch}:refs/remotes/${input.remoteName}/${branch}`,
     ];
     const result = yield* runFetch(scopedArgs);
@@ -4524,7 +4552,7 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
 
   const fetchWorktreeBaseCommit: GitVcsDriver.GitVcsDriver["Service"]["fetchWorktreeBaseCommit"] =
     Effect.fn("fetchWorktreeBaseCommit")(function* (input) {
-      const target = yield* resolveWorktreeBaseRemote(input);
+      const target = input.remote ?? (yield* resolveWorktreeBaseRemote(input));
       if (target === null) return null;
       const { remoteName, branchName } = target;
       const remoteRefName = `${remoteName}/${branchName}`;
