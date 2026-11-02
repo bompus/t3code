@@ -31,6 +31,13 @@ const toolInstructions = (availability: boolean | T3CodeToolAvailability): strin
     .join("\n\n");
 };
 
+/**
+ * Codex's `spawn_agent` keeps the parent's whole conversation by default, and its
+ * own description warns that `fork_turns: "none"` can leave a child without the
+ * context it needs. Say why the brief is enough, or the model takes the default.
+ */
+const T3_CODE_CODEX_NATIVE_CHILDREN = `Native subagents: pass \`fork_turns: "none"\` on every \`spawn_agent\` call unless the child needs the parent's conversation. Native children share the workspace and can read files themselves.`;
+
 export interface CodexRuntimeInfo {
   readonly model: string;
   readonly modelName?: string | undefined;
@@ -51,6 +58,10 @@ export function buildCodexAdditionalContext(
         { kind: "application" as const, value: section },
       ]),
     ),
+    t3_code_codex_subagents: {
+      kind: "application",
+      value: T3_CODE_CODEX_NATIVE_CHILDREN,
+    },
     t3_code_runtime: {
       kind: "application",
       value: buildRuntimeInstructions({ harness: "Codex", ...runtime }),
