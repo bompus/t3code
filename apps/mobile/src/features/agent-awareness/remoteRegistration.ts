@@ -275,7 +275,11 @@ const nativePushTokenRegistration = Effect.fn("remoteRegistration.nativePushToke
           logRegistrationError("native push token lookup failed", error);
         }),
       ),
-      Effect.orElseSucceed(() => null),
+      // Android alerts and activity share this token. A failed lookup must not
+      // replace an accepted relay registration with notifications disabled.
+      Effect.catch((error) =>
+        Platform.OS === "android" ? Effect.fail(error) : Effect.succeed(null),
+      ),
     );
     const pushToken =
       token?.type === Platform.OS && typeof token.data === "string" && token.data.trim().length > 0
