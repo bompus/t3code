@@ -2,6 +2,7 @@ import { useAtomValue } from "@effect/atom-react";
 import type { ServerUpdateState } from "@t3tools/client-runtime/state/server";
 import { useState } from "react";
 
+import { useDesktopRelaunchesServer } from "~/state/desktopSshServerKind";
 import { environmentIdsKey } from "~/state/environmentAtomList";
 import type { EnvironmentPresentation } from "~/state/environments";
 import { environmentUpdateStatesAtom } from "~/state/server";
@@ -14,9 +15,9 @@ import {
   resolveServerConfigVersionMismatch,
   resolveServerSelfUpdateCapability,
   supportsDesktopAppUpdate,
-  supportsServerUpdateThreadContinuation,
 } from "~/versionSkew";
 import {
+  DESKTOP_RELAUNCH_NOTICE,
   ServerUpdateAction,
   ServerUpdateProgress,
   ServerUpdatesAction,
@@ -34,6 +35,7 @@ export function useAutoBalanceUpdateBanner(
       environmentIdsKey(environments.map(({ environmentId }) => environmentId)),
     ),
   );
+  const desktopRelaunchesServer = useDesktopRelaunchesServer();
   const states = environments.flatMap((environment, index) => {
     const state = updateStates[index];
     return state ? [{ environment, state }] : [];
@@ -63,12 +65,10 @@ export function useAutoBalanceUpdateBanner(
         selfUpdate,
         installation: environment.serverConfig?.environment.capabilities.serverInstallation,
         desktopAppUpdate,
-        threadContinuation: supportsServerUpdateThreadContinuation(environment.serverConfig),
-        continueThreadsAfterServerUpdate:
-          environment.serverConfig?.settings.continueThreadsAfterServerUpdate ?? false,
         targetVersion: state.status === "idle" ? mismatch!.clientVersion : state.targetVersion,
         connected: environment.connection.phase === "connected",
         remoteUpdate: selfUpdate !== null && (selfUpdate !== "desktop-managed" || desktopAppUpdate),
+        desktopRelaunched: selfUpdate === null && desktopRelaunchesServer(environment),
         state,
         dismissKey,
       },
@@ -78,7 +78,9 @@ export function useAutoBalanceUpdateBanner(
 
   const running = machines.filter((machine) => machine.state.status === "running").length;
   const failed = machines.filter((machine) => machine.state.status === "failed").length;
-  const manual = machines.filter((machine) => !machine.remoteUpdate).length;
+  const manual = machines.filter(
+    (machine) => !machine.remoteUpdate && !machine.desktopRelaunched,
+  ).length;
   const targets = machines.filter(
     (machine) => machine.connected && machine.remoteUpdate && machine.state.status !== "running",
   );
@@ -89,7 +91,7 @@ export function useAutoBalanceUpdateBanner(
   return {
     id: `auto-balance-server-updates-${dismissedNotices.size}`,
     variant: failed ? "error" : "default",
-    priority: running ? "urgent" : "notice",
+    group: "environment",
     icon: <ComposerServerUpdateIcon status={status} />,
     title: (
       <Popover>
@@ -107,6 +109,8 @@ export function useAutoBalanceUpdateBanner(
                 <div className="font-medium">{machine.serverLabel}</div>
                 {machine.state.status !== "idle" ? (
                   <ServerUpdateProgress state={machine.state} />
+                ) : machine.desktopRelaunched ? (
+                  <div className="text-muted-foreground">{DESKTOP_RELAUNCH_NOTICE}</div>
                 ) : !machine.remoteUpdate ? (
                   <>
                     <div className="text-muted-foreground">Manual update required</div>
