@@ -25,6 +25,7 @@ import {
   PinnedRuntimeInstallError,
 } from "./pinnedRuntime.ts";
 import {
+  BOOT_SERVICE_LOG_ENV,
   SERVICE_LAUNCHER_PROTOCOL,
   SERVICE_RESTART_PENDING_FILE,
   SERVICE_STATE_FILE,
@@ -105,6 +106,7 @@ export function renderBootServiceUnit(plan: BootServicePlan): string {
     "WorkingDirectory=%h",
     `Environment=T3CODE_HOME=${quoteSystemdValue(plan.baseDir)}`,
     `Environment=${BOOT_SERVICE_UNIT_ENV}=${BOOT_SERVICE_UNIT_FILE}`,
+    `Environment=${BOOT_SERVICE_LOG_ENV}=${quoteSystemdValue(plan.logPath)}`,
     `ExecStart=${plan.program.map(quoteSystemdValue).join(" ")}`,
     // Let the launcher mark an explicit stop before it signals the server.
     // systemd still SIGKILLs the whole cgroup if graceful shutdown times out.
@@ -164,6 +166,8 @@ export function renderBootServicePlist(
     `    <string>${escapeXmlText(plan.baseDir)}</string>`,
     `    <key>${BOOT_SERVICE_UNIT_ENV}</key>`,
     `    <string>${BOOT_SERVICE_PLIST_FILE}</string>`,
+    `    <key>${BOOT_SERVICE_LOG_ENV}</key>`,
+    `    <string>${escapeXmlText(plan.logPath)}</string>`,
     `  </dict>`,
     `  <key>WorkingDirectory</key>`,
     `  <string>${escapeXmlText(options.homeDir)}</string>`,
