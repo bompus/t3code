@@ -472,18 +472,24 @@ export async function runUpdateEverything<Providers, Servers>(
   readonly servers: Servers;
 }> {
   const serverTarget = steps.serverTarget ?? Promise.resolve(undefined);
+  let providersRunning = true;
+  const local = steps.downloadLocal?.() ?? Promise.resolve(true);
+  const providers = steps.updateProviders().finally(() => {
+    providersRunning = false;
+  });
+  // Staging only helps while providers install; once they settle, servers update directly.
   const staged = serverTarget.then(
     (target) =>
       new Map(
-        Array.from(steps.stageServers?.(target) ?? [], ([id, stage]) => [
-          id,
-          stage.catch(() => undefined),
-        ]),
+        Array.from(
+          (providersRunning ? steps.stageServers?.(target) : undefined) ?? [],
+          ([id, stage]) => [id, stage.catch(() => undefined)],
+        ),
       ),
   );
   const [localReady, remote] = await Promise.all([
-    steps.downloadLocal?.() ?? Promise.resolve(true),
-    steps.updateProviders().then(async (providers) => ({
+    local,
+    providers.then(async (providers) => ({
       providers,
       servers: await steps.updateServers(await staged, await serverTarget),
     })),

@@ -417,42 +417,68 @@ describe("runUpdateEverything", () => {
   it("stages and updates servers with the version the local download fetches", async () => {
     const calls: string[] = [];
     let knowTarget = (_version: string) => {};
+    let finishProviders = () => {};
     let finishDownload = () => {};
-    let serversStarted = () => {};
-    const serversStart = new Promise<void>((resolve) => (serversStarted = resolve));
+    let markStaged = () => {};
+    let markServersStarted = () => {};
+    const staging = new Promise<void>((resolve) => (markStaged = resolve));
+    const serversStarted = new Promise<void>((resolve) => (markServersStarted = resolve));
     const run = runUpdateEverything({
       downloadLocal: () =>
         new Promise<boolean>((resolve) => (finishDownload = () => resolve(true))),
       serverTarget: new Promise<string>((resolve) => (knowTarget = resolve)),
+      updateProviders: () => {
+        calls.push("providers");
+        return new Promise<void>((resolve) => (finishProviders = resolve));
+      },
+      stageServers: (target) => {
+        calls.push(`stage ${target}`);
+        markStaged();
+        return new Map();
+      },
+      updateServers: async (_staged, target) => {
+        calls.push(`servers ${target}`);
+        markServersStarted();
+      },
+    });
+    knowTarget("1.2.0");
+    await staging;
+    finishProviders();
+    // Servers do not wait for the download to finish.
+    await serversStarted;
+    calls.push("downloaded");
+    finishDownload();
+    const result = await run;
+
+    expect(calls).toEqual(["providers", "stage 1.2.0", "servers 1.2.0", "downloaded"]);
+    expect(result.localReady).toBe(true);
+  });
+
+  it("skips staging when providers finish before the download's version is known", async () => {
+    const calls: string[] = [];
+    let knowTarget = (_version: string) => {};
+    let providersDone = () => {};
+    const providersFinished = new Promise<void>((resolve) => (providersDone = resolve));
+    const run = runUpdateEverything({
+      downloadLocal: async () => true,
+      serverTarget: new Promise<string>((resolve) => (knowTarget = resolve)),
       updateProviders: async () => {
         calls.push("providers");
+        providersDone();
       },
       stageServers: (target) => {
         calls.push(`stage ${target}`);
         return new Map();
       },
-      updateServers: async (_staged, target) => {
-        calls.push(`servers ${target}`);
-        serversStarted();
+      updateServers: async (staged, target) => {
+        calls.push(`servers ${target} staged ${staged.size}`);
       },
     });
-    await Promise.resolve();
-    calls.push("download started");
+    await providersFinished;
     knowTarget("1.2.0");
-    // Servers do not wait for the download to finish.
-    await serversStart;
-    calls.push("downloaded");
-    finishDownload();
-    const result = await run;
+    await run;
 
-    expect(calls).toEqual([
-      "providers",
-      "download started",
-      "stage 1.2.0",
-      "servers 1.2.0",
-      "downloaded",
-    ]);
-    expect(result.localReady).toBe(true);
+    expect(calls).toEqual(["providers", "servers 1.2.0 staged 0"]);
   });
 
   it("still updates remote machines when the local download fails", async () => {
