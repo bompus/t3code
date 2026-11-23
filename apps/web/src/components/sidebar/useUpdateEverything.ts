@@ -21,7 +21,9 @@ import {
   collectServerUpdateTargets,
   collectUpdateEverythingResult,
   describeUpdateEverything,
+  retargetServerUpdates,
   runUpdateEverything,
+  startServerPhase,
   type UpdateRunMachine,
 } from "./updateEverything.logic";
 import {
@@ -108,7 +110,8 @@ export function useUpdateEverything(
       downloadLocal,
       installLocal,
     }: {
-      downloadLocal?: (reportError: ReportLocalUpdateError) => Promise<boolean>;
+      /** Resolves to the version this app downloaded, or null when it could not. */
+      downloadLocal?: (reportError: ReportLocalUpdateError) => Promise<string | null>;
       installLocal?: (reportError: ReportLocalUpdateError) => Promise<boolean>;
     }) => {
       const localFailures: Array<string> = [];
@@ -152,6 +155,9 @@ export function useUpdateEverything(
         restartAt: null,
         machines: Array.from(machinesById.values()),
       }));
+      // A track switch keeps the release its database check covered.
+      const serversFor = (version: string | null | undefined) =>
+        channelSwitch ? servers : retargetServerUpdates(servers, version);
       const providerFailures = new Map<UpdateRunMachine["environmentId"], string>();
       const finishedServers: Array<{ label: string; outcome: ServerUpdateOutcome }> = [];
       try {
@@ -179,24 +185,14 @@ export function useUpdateEverything(
                 );
               }
             }
-            const serversStartedAt = Date.now();
-            setUpdateEverythingRun(
-              (run) =>
-                run && {
-                  ...run,
-                  phase: "servers",
-                  machines: run.machines.map((machine) =>
-                    machine.server === null ? machine : { ...machine, startedAt: serversStartedAt },
-                  ),
-                },
-            );
+            setUpdateEverythingRun((run) => run && { ...run, phase: "servers" });
             return outcomes;
           },
           ...(providers.machines.length > 0
             ? {
-                stageServers: () =>
+                stageServers: (version) =>
                   new Map(
-                    servers
+                    serversFor(version)
                       .filter(
                         (server) =>
                           machines.find((machine) => machine.environmentId === server.environmentId)
@@ -212,8 +208,13 @@ export function useUpdateEverything(
                   ),
               }
             : {}),
-          updateServers: async (staged) => {
-            const runs = servers.map(async (server) => {
+          updateServers: async (staged, version) => {
+            const targets = serversFor(version);
+            const serversStartedAt = Date.now();
+            setUpdateEverythingRun(
+              (run) => run && startServerPhase(run, targets, serversStartedAt),
+            );
+            const runs = targets.map(async (server) => {
               await staged.get(server.environmentId);
               const serverOutcome = await updateServer(server, { quiet: true });
               settleUpdateRunMachine(
@@ -231,7 +232,7 @@ export function useUpdateEverything(
               return finished;
             });
             await Promise.all(
-              servers.map((server, index) =>
+              targets.map((server, index) =>
                 waitForServerUpdateHandoff(server.environmentId, runs[index]!),
               ),
             );
@@ -250,7 +251,10 @@ export function useUpdateEverything(
             setUpdateEverythingRun(
               (run) => run && { ...run, phase: "installing", restartAt: null },
             );
-            saveUpdateEverythingResult({ ...result(finishedServers), localVersion });
+            saveUpdateEverythingResult({
+              ...result(finishedServers),
+              localVersion: outcome.localVersion ?? localVersion,
+            });
             if (await installLocal(reportLocalError)) return;
             clearSavedUpdateEverythingResult();
           }

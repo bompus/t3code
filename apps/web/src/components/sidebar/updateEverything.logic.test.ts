@@ -8,7 +8,9 @@ import {
   collectServerUpdateTargets,
   describeUpdateCapsule,
   describeUpdateEverything,
+  retargetServerUpdates,
   runUpdateEverything,
+  startServerPhase,
   type UpdateEverythingMachine,
 } from "./updateEverything.logic";
 
@@ -344,11 +346,105 @@ describe("collectRestartingMachines", () => {
   });
 });
 
+describe("retargetServerUpdates", () => {
+  const targets = collectServerUpdateTargets(
+    [machine("service", "1.0.0", "boot-service"), machine("mac", "1.0.0", "desktop-managed")],
+    "1.1.0",
+  ).targets;
+
+  it("moves the confirmed servers to the version this app downloaded", () => {
+    expect(
+      retargetServerUpdates(targets, "1.2.0").map(({ environmentId, targetVersion }) => [
+        environmentId,
+        targetVersion,
+      ]),
+    ).toEqual([
+      ["service", "1.2.0"],
+      ["mac", "1.2.0"],
+    ]);
+  });
+
+  it("keeps the planned targets when this app downloaded nothing", () => {
+    expect(retargetServerUpdates(targets, null)).toBe(targets);
+    expect(retargetServerUpdates(targets, undefined)).toBe(targets);
+  });
+});
+
+describe("startServerPhase", () => {
+  it("starts each server's clock when servers update, with its final target", () => {
+    const [planned] = collectServerUpdateTargets(
+      [machine("service", "1.0.0", "boot-service")],
+      "1.1.0",
+    ).targets;
+    const providersOnly = {
+      environmentId: EnvironmentId.make("laptop"),
+      label: "laptop",
+      updatesProviders: true,
+      server: null,
+      handedOffVersion: null,
+      startedAt: 0,
+      result: "done" as const,
+      failure: null,
+      providerFailure: null,
+    };
+    const run = {
+      localVersion: "1.2.0",
+      phase: "servers" as const,
+      restartAt: null,
+      machines: [
+        providersOnly,
+        {
+          ...providersOnly,
+          environmentId: planned!.environmentId,
+          label: "service",
+          updatesProviders: false,
+          server: planned!,
+          result: null,
+        },
+      ],
+    };
+
+    const started = startServerPhase(run, retargetServerUpdates([planned!], "1.2.0"), 30 * 60_000);
+
+    expect(started.machines[0]).toBe(providersOnly);
+    expect(started.machines[1]).toMatchObject({
+      startedAt: 30 * 60_000,
+      server: { targetVersion: "1.2.0" },
+    });
+  });
+});
+
 describe("runUpdateEverything", () => {
+  it("stages and updates servers with the version the local download reports", async () => {
+    const calls: string[] = [];
+    let finishDownload = (_version: string) => {};
+    const download = new Promise<string>((resolve) => (finishDownload = resolve));
+    const run = runUpdateEverything({
+      downloadLocal: () => download,
+      updateProviders: async () => {
+        calls.push("providers");
+      },
+      stageServers: (version) => {
+        calls.push(`stage ${version}`);
+        return new Map();
+      },
+      updateServers: async (_staged, version) => {
+        calls.push(`servers ${version}`);
+      },
+    });
+    await Promise.resolve();
+    calls.push("downloaded");
+    finishDownload("1.2.0");
+    const result = await run;
+
+    expect(calls).toEqual(["providers", "downloaded", "stage 1.2.0", "servers 1.2.0"]);
+    expect(result).toMatchObject({ localReady: true, localVersion: "1.2.0" });
+  });
+
   it("still updates remote machines when the local download fails", async () => {
     const calls: string[] = [];
     const result = await runUpdateEverything({
-      downloadLocal: async () => false,
+      downloadLocal: async () => null,
       updateProviders: async () => {
         calls.push("providers");
       },
@@ -396,8 +492,8 @@ describe("runUpdateEverything", () => {
     await run;
 
     expect(calls).toEqual([
-      "stage",
       "providers",
+      "stage",
       "providers done",
       "servers",
       "server fast",
