@@ -108,10 +108,12 @@ export function useUpdateEverything(
     restarts,
     run: async ({
       downloadLocal,
+      serverTarget,
       installLocal,
     }: {
-      /** Resolves to the version this app downloaded, or null when it could not. */
-      downloadLocal?: (reportError: ReportLocalUpdateError) => Promise<string | null>;
+      downloadLocal?: (reportError: ReportLocalUpdateError) => Promise<boolean>;
+      /** The version the local download fetches, known once it starts; see runUpdateEverything. */
+      serverTarget?: Promise<string | undefined>;
       installLocal?: (reportError: ReportLocalUpdateError) => Promise<boolean>;
     }) => {
       const localFailures: Array<string> = [];
@@ -148,6 +150,7 @@ export function useUpdateEverything(
         });
       }
       const localVersion = installLocal ? localUpdateVersion : null;
+      let downloadedVersion = localVersion;
       setUpdateEverythingRun(() => ({
         ...(channelSwitch ? { trackSwitch: true } : {}),
         localVersion,
@@ -156,13 +159,24 @@ export function useUpdateEverything(
         machines: Array.from(machinesById.values()),
       }));
       // A track switch keeps the release its database check covered.
-      const serversFor = (version: string | null | undefined) =>
+      const serversFor = (version: string | undefined) =>
         channelSwitch ? servers : retargetServerUpdates(servers, version);
       const providerFailures = new Map<UpdateRunMachine["environmentId"], string>();
       const finishedServers: Array<{ label: string; outcome: ServerUpdateOutcome }> = [];
       try {
         const outcome = await runUpdateEverything({
           ...(downloadLocal ? { downloadLocal: () => downloadLocal(reportLocalError) } : {}),
+          ...(serverTarget && !channelSwitch
+            ? {
+                serverTarget: serverTarget.then((target) => {
+                  if (target !== undefined && localVersion !== null) {
+                    downloadedVersion = target;
+                    setUpdateEverythingRun((run) => run && { ...run, localVersion: target });
+                  }
+                  return target;
+                }),
+              }
+            : {}),
           updateProviders: async () => {
             const runs = await providers.updateAll({ quiet: true });
             const outcomes = runs.map((run) => {
@@ -208,8 +222,8 @@ export function useUpdateEverything(
                   ),
               }
             : {}),
-          updateServers: async (staged, version) => {
-            const targets = serversFor(version);
+          updateServers: async (staged, target) => {
+            const targets = serversFor(target);
             const serversStartedAt = Date.now();
             setUpdateEverythingRun(
               (run) => run && startServerPhase(run, targets, serversStartedAt),
@@ -253,7 +267,7 @@ export function useUpdateEverything(
             );
             saveUpdateEverythingResult({
               ...result(finishedServers),
-              localVersion: outcome.localVersion ?? localVersion,
+              localVersion: downloadedVersion,
             });
             if (await installLocal(reportLocalError)) return;
             clearSavedUpdateEverythingResult();

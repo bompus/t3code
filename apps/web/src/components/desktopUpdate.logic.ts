@@ -249,6 +249,35 @@ export async function installDesktopUpdate(
   }
 }
 
+/**
+ * The version a desktop download fetches. The download checks the feed again before it starts, so
+ * this can be newer than the offer it began from; it is known once the download starts. Undefined
+ * when the download settles without starting, or does not start within `timeoutMs`.
+ */
+export function watchDesktopDownloadVersion(
+  bridge: Pick<DesktopBridge, "onUpdateState">,
+  download: Promise<unknown>,
+  timeoutMs = 60_000,
+): Promise<string | undefined> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (version: string | undefined) => {
+      if (settled) return;
+      settled = true;
+      unsubscribe();
+      clearTimeout(timer);
+      resolve(version);
+    };
+    const unsubscribe = bridge.onUpdateState((state) => {
+      if (state.status === "downloading" || state.status === "downloaded") {
+        finish(getDesktopUpdateDownloadedVersion(state) ?? undefined);
+      }
+    });
+    const timer = setTimeout(() => finish(undefined), timeoutMs);
+    void download.finally(() => finish(undefined));
+  });
+}
+
 export function shouldToastDesktopUpdateActionResult(result: DesktopUpdateActionResult): boolean {
   return getDesktopUpdateActionError(result) !== null;
 }
