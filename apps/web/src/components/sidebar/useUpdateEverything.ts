@@ -111,7 +111,8 @@ export function useUpdateEverything(
       serverTarget,
       installLocal,
     }: {
-      downloadLocal?: (reportError: ReportLocalUpdateError) => Promise<boolean>;
+      /** Resolves to the version this app downloaded, or null when it could not. */
+      downloadLocal?: (reportError: ReportLocalUpdateError) => Promise<string | null>;
       /** The version the local download fetches, known once it starts; see runUpdateEverything. */
       serverTarget?: Promise<string | undefined>;
       installLocal?: (reportError: ReportLocalUpdateError) => Promise<boolean>;
@@ -267,7 +268,8 @@ export function useUpdateEverything(
             );
             saveUpdateEverythingResult({
               ...result(finishedServers),
-              localVersion: downloadedVersion,
+              // The download can finish after the server target gave up waiting for it.
+              localVersion: outcome.localVersion ?? downloadedVersion,
             });
             if (await installLocal(reportLocalError)) return;
             clearSavedUpdateEverythingResult();

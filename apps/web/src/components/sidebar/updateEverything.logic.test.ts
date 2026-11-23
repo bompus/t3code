@@ -364,6 +364,10 @@ describe("retargetServerUpdates", () => {
     ]);
   });
 
+  it("never moves a server below its planned target", () => {
+    expect(retargetServerUpdates(targets, "1.0.5")).toEqual(targets);
+  });
+
   it("keeps the planned targets when the download version is unknown", () => {
     expect(retargetServerUpdates(targets, undefined)).toBe(targets);
   });
@@ -425,7 +429,7 @@ describe("runUpdateEverything", () => {
     const serversStarted = new Promise<void>((resolve) => (markServersStarted = resolve));
     const run = runUpdateEverything({
       downloadLocal: () =>
-        new Promise<boolean>((resolve) => (finishDownload = () => resolve(true))),
+        new Promise<string>((resolve) => (finishDownload = () => resolve("1.2.0"))),
       serverTarget: new Promise<string>((resolve) => (knowTarget = resolve)),
       updateProviders: () => {
         calls.push("providers");
@@ -451,7 +455,7 @@ describe("runUpdateEverything", () => {
     const result = await run;
 
     expect(calls).toEqual(["providers", "stage 1.2.0", "servers 1.2.0", "downloaded"]);
-    expect(result.localReady).toBe(true);
+    expect(result).toMatchObject({ localReady: true, localVersion: "1.2.0" });
   });
 
   it("skips staging when providers finish before the download's version is known", async () => {
@@ -460,7 +464,7 @@ describe("runUpdateEverything", () => {
     let providersDone = () => {};
     const providersFinished = new Promise<void>((resolve) => (providersDone = resolve));
     const run = runUpdateEverything({
-      downloadLocal: async () => true,
+      downloadLocal: async () => "1.2.0",
       serverTarget: new Promise<string>((resolve) => (knowTarget = resolve)),
       updateProviders: async () => {
         calls.push("providers");
@@ -481,10 +485,26 @@ describe("runUpdateEverything", () => {
     expect(calls).toEqual(["providers", "servers 1.2.0 staged 0"]);
   });
 
+  it("reports the downloaded version even when servers kept the planned target", async () => {
+    const targets: Array<string | undefined> = [];
+    const result = await runUpdateEverything({
+      downloadLocal: async () => "1.2.0",
+      // The download did not start in time, so servers keep their planned target.
+      serverTarget: Promise.resolve(undefined),
+      updateProviders: async () => {},
+      updateServers: async (_staged, target) => {
+        targets.push(target);
+      },
+    });
+
+    expect(targets).toEqual([undefined]);
+    expect(result).toMatchObject({ localReady: true, localVersion: "1.2.0" });
+  });
+
   it("still updates remote machines when the local download fails", async () => {
     const calls: string[] = [];
     const result = await runUpdateEverything({
-      downloadLocal: async () => false,
+      downloadLocal: async () => null,
       updateProviders: async () => {
         calls.push("providers");
       },

@@ -441,13 +441,17 @@ export function retargetServerUpdates(
   localVersion: string | undefined,
 ): ReadonlyArray<ServerUpdateTarget> {
   if (localVersion === undefined) return targets;
+  // A stale feed can serve an older build than planned, which a server may already run; only move up.
   return targets.map((target) =>
-    target.targetVersion === localVersion ? target : { ...target, targetVersion: localVersion },
+    compareSemverVersions(localVersion, target.targetVersion) > 0
+      ? { ...target, targetVersion: localVersion }
+      : target,
   );
 }
 
 export interface UpdateEverythingSteps<Providers, Servers> {
-  readonly downloadLocal?: () => Promise<boolean>;
+  /** Resolves to the version this app downloaded, or null when the download failed. */
+  readonly downloadLocal?: () => Promise<string | null>;
   /** The version servers move to, once the local download knows it; undefined keeps the plan. */
   readonly serverTarget?: Promise<string | undefined>;
   readonly updateProviders: () => Promise<Providers>;
@@ -468,12 +472,14 @@ export async function runUpdateEverything<Providers, Servers>(
   steps: UpdateEverythingSteps<Providers, Servers>,
 ): Promise<{
   readonly localReady: boolean;
+  /** The version this app downloaded; undefined when the run downloads nothing. */
+  readonly localVersion: string | undefined;
   readonly providers: Providers;
   readonly servers: Servers;
 }> {
   const serverTarget = steps.serverTarget ?? Promise.resolve(undefined);
   let providersRunning = true;
-  const local = steps.downloadLocal?.() ?? Promise.resolve(true);
+  const local = steps.downloadLocal?.() ?? Promise.resolve(undefined);
   const providers = steps.updateProviders().finally(() => {
     providersRunning = false;
   });
@@ -487,14 +493,14 @@ export async function runUpdateEverything<Providers, Servers>(
         ),
       ),
   );
-  const [localReady, remote] = await Promise.all([
+  const [localVersion, remote] = await Promise.all([
     local,
     providers.then(async (providers) => ({
       providers,
       servers: await steps.updateServers(await staged, await serverTarget),
     })),
   ]);
-  return { localReady, ...remote };
+  return { localReady: localVersion !== null, localVersion: localVersion ?? undefined, ...remote };
 }
 
 export type UpdateRunMachineStatus =
