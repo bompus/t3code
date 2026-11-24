@@ -9,6 +9,7 @@ import {
   getDesktopUpdateReleaseUrl,
   installDesktopUpdate,
   resolveDesktopUpdateButtonAction,
+  watchDesktopDownloadVersion,
 } from "./desktopUpdate.logic";
 
 const baseState: DesktopUpdateState = {
@@ -175,5 +176,50 @@ describe("canCheckForUpdate", () => {
         downloadedVersion: "1.1.0",
       }),
     ).toBe(true);
+  });
+});
+
+describe("watchDesktopDownloadVersion", () => {
+  function updateStates() {
+    const listeners = new Set<(state: DesktopUpdateState) => void>();
+    return {
+      bridge: {
+        onUpdateState: (listener: (state: DesktopUpdateState) => void) => {
+          listeners.add(listener);
+          return () => listeners.delete(listener);
+        },
+      },
+      emit: (state: DesktopUpdateState) => listeners.forEach((listener) => listener(state)),
+      listening: () => listeners.size,
+    };
+  }
+  const offered: DesktopUpdateState = {
+    ...baseState,
+    status: "available",
+    availableVersion: "1.1.0",
+  };
+
+  it("reports the release the download started on, not the offer before its check", async () => {
+    const states = updateStates();
+    const version = watchDesktopDownloadVersion(states.bridge, new Promise(() => {}));
+    states.emit(offered);
+    states.emit({ ...offered, availableVersion: "1.2.0" });
+    states.emit({ ...offered, status: "downloading", availableVersion: "1.2.0" });
+
+    await expect(version).resolves.toBe("1.2.0");
+    expect(states.listening()).toBe(0);
+  });
+
+  it("gives up when the download settles without starting or never starts", async () => {
+    const refused = updateStates();
+    await expect(
+      watchDesktopDownloadVersion(refused.bridge, Promise.resolve(false)),
+    ).resolves.toBeUndefined();
+
+    const stalled = updateStates();
+    await expect(
+      watchDesktopDownloadVersion(stalled.bridge, new Promise(() => {}), 1),
+    ).resolves.toBeUndefined();
+    expect(stalled.listening()).toBe(0);
   });
 });

@@ -442,35 +442,73 @@ function trackSwitchMove(
   return { selfUpdate };
 }
 
+/** Servers move to the version this app downloaded, which can be newer than the offer the run was
+ * planned from. Only the confirmed machines update; one the new version would add waits for a later run. */
+export function retargetServerUpdates(
+  targets: ReadonlyArray<ServerUpdateTarget>,
+  localVersion: string | undefined,
+): ReadonlyArray<ServerUpdateTarget> {
+  if (localVersion === undefined) return targets;
+  // A stale feed can serve an older build than planned, which a server may already run; only move up.
+  return targets.map((target) =>
+    compareSemverVersions(localVersion, target.targetVersion) > 0
+      ? { ...target, targetVersion: localVersion }
+      : target,
+  );
+}
+
 export interface UpdateEverythingSteps<Providers, Servers> {
-  readonly downloadLocal?: () => Promise<boolean>;
+  /** Resolves to the version this app downloaded, or null when the download failed. */
+  readonly downloadLocal?: () => Promise<string | null>;
+  /** The version servers move to, once the local download knows it; undefined keeps the plan. */
+  readonly serverTarget?: Promise<string | undefined>;
   readonly updateProviders: () => Promise<Providers>;
-  readonly stageServers?: () => ReadonlyMap<EnvironmentId, Promise<unknown>>;
+  readonly stageServers?: (
+    serverTarget: string | undefined,
+  ) => ReadonlyMap<EnvironmentId, Promise<unknown>>;
   readonly updateServers: (
     staged: ReadonlyMap<EnvironmentId, Promise<unknown>>,
+    serverTarget: string | undefined,
   ) => Promise<Servers>;
 }
 
 /** Finish provider installs before server restarts; servers stage meanwhile and each server's
- * update waits only on its own stage. Install this app last when localReady; failed downloads skip
- * only that install. */
+ * update waits only on its own stage. Servers stage once `serverTarget` settles, which the local
+ * download resolves after its own feed check, so they get the build this app downloads.
+ * Install this app last when localReady; failed downloads skip only that install. */
 export async function runUpdateEverything<Providers, Servers>(
   steps: UpdateEverythingSteps<Providers, Servers>,
 ): Promise<{
   readonly localReady: boolean;
+  /** The version this app downloaded; undefined when the run downloads nothing. */
+  readonly localVersion: string | undefined;
   readonly providers: Providers;
   readonly servers: Servers;
 }> {
-  const staged = new Map(
-    Array.from(steps.stageServers?.() ?? [], ([id, stage]) => [id, stage.catch(() => undefined)]),
+  const serverTarget = steps.serverTarget ?? Promise.resolve(undefined);
+  let providersRunning = true;
+  const local = steps.downloadLocal?.() ?? Promise.resolve(undefined);
+  const providers = steps.updateProviders().finally(() => {
+    providersRunning = false;
+  });
+  // Staging only helps while providers install; once they settle, servers update directly.
+  const staged = serverTarget.then(
+    (target) =>
+      new Map(
+        Array.from(
+          (providersRunning ? steps.stageServers?.(target) : undefined) ?? [],
+          ([id, stage]) => [id, stage.catch(() => undefined)],
+        ),
+      ),
   );
-  const [localReady, remote] = await Promise.all([
-    steps.downloadLocal?.() ?? Promise.resolve(true),
-    steps
-      .updateProviders()
-      .then(async (providers) => ({ providers, servers: await steps.updateServers(staged) })),
+  const [localVersion, remote] = await Promise.all([
+    local,
+    providers.then(async (providers) => ({
+      providers,
+      servers: await steps.updateServers(await staged, await serverTarget),
+    })),
   ]);
-  return { localReady, ...remote };
+  return { localReady: localVersion !== null, localVersion: localVersion ?? undefined, ...remote };
 }
 
 export type UpdateRunMachineStatus =
@@ -518,6 +556,23 @@ export function resolveUpdateRunMachineStatus(
 
 export function isServerUpdateHandedOff(state: ServerUpdateState): boolean {
   return state.status === "running" && state.stage === "resuming";
+}
+
+/** Servers start updating after providers finish and the local download's version is known, so
+ * each server's reconnect deadline counts from here, toward its final target. */
+export function startServerPhase(
+  run: UpdateEverythingRun,
+  targets: ReadonlyArray<ServerUpdateTarget>,
+  startedAt: number,
+): UpdateEverythingRun {
+  const targetsById = new Map(targets.map((target) => [target.environmentId, target]));
+  return {
+    ...run,
+    machines: run.machines.map((machine) => {
+      const server = targetsById.get(machine.environmentId);
+      return server === undefined ? machine : { ...machine, server, startedAt };
+    }),
+  };
 }
 
 export function closeFinishedUpdateRun(run: UpdateEverythingRun): UpdateEverythingRun | null {

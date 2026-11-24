@@ -27,6 +27,7 @@ import {
   resolveDesktopUpdateButtonAction,
   shouldShowArm64IntelBuildWarning,
   shouldToastDesktopUpdateActionResult,
+  watchDesktopDownloadVersion,
 } from "../desktopUpdate.logic";
 import { showDesktopUpdateDownloadedToast } from "../desktopUpdate.toast";
 import { useCheckProviderUpdates } from "../ProviderUpdatesAction";
@@ -151,7 +152,7 @@ export async function downloadLocalUpdate(
     notifyDownloaded,
     reportError = toastUpdateError,
   }: { readonly notifyDownloaded: boolean; readonly reportError?: ReportLocalUpdateError },
-): Promise<boolean> {
+): Promise<string | null> {
   try {
     const result = await bridge.downloadUpdate();
     if (result.completed && notifyDownloaded) {
@@ -161,13 +162,14 @@ export async function downloadLocalUpdate(
       ? getDesktopUpdateActionError(result)
       : null;
     if (actionError) reportError(m(msg("Could not download update")), actionError);
-    return result.completed;
+    // The download checks the feed again, so this can be newer than the offer it started from.
+    return result.completed ? getDesktopUpdateDownloadedVersion(result.state) : null;
   } catch (error) {
     reportError(
       m(msg("Could not start update download")),
       thrownErrorMessage(error, m) ?? m(msg("An unexpected error occurred.")),
     );
-    return false;
+    return null;
   }
 }
 
@@ -375,12 +377,24 @@ function SidebarUpdateControl() {
     const bridge = window.desktopBridge;
     setIsConfirmingEverything(false);
     setIsActionPending(true);
+    // Servers follow the build the download fetches, known once it starts.
+    let startServerTarget: (target: Promise<string | undefined>) => void = () => {};
+    const serverTarget = new Promise<string | undefined>((resolve) => {
+      startServerTarget = resolve;
+    });
     const result = await settlePromise(() =>
       everything.run({
         ...(bridge && action === "download"
           ? {
-              downloadLocal: (reportError) =>
-                downloadLocalUpdate(bridge, { notifyDownloaded: false, reportError }),
+              downloadLocal: (reportError) => {
+                const download = downloadLocalUpdate(bridge, {
+                  notifyDownloaded: false,
+                  reportError,
+                });
+                startServerTarget(watchDesktopDownloadVersion(bridge, download));
+                return download;
+              },
+              serverTarget,
             }
           : {}),
         ...(bridge && action !== "none"
